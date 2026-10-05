@@ -101,6 +101,86 @@ def _parse_llm_seeds(text: str) -> List[bytes]:
     return [s[:MAX_INPUT] for s in out if s]
 
 
+def _run_generator_program(code: str, out_dir: str, timeout: int = 20) -> List[bytes]:
+    """Run an untrusted model-written generator program in a locked-down
+    subprocess (no args, CPU/File limits, its own temp dir) and collect the
+    seed files it writes to the directory given as argv[1]."""
+    import sys
+    os.makedirs(out_dir, exist_ok=True)
+    prog = os.path.join(out_dir, "_gen.py")
+    util.write_text(prog, code)
+    r = util.run([sys.executable, prog, out_dir], timeout=timeout, cpu_seconds=timeout)
+    seeds = []
+    for name in sorted(os.listdir(out_dir)):
+        if name == "_gen.py":
+            continue
+        fp = os.path.join(out_dir, name)
+        try:
+            if os.path.isfile(fp) and os.path.getsize(fp) <= MAX_INPUT:
+                with open(fp, "rb") as f:
+                    seeds.append(f.read())
+        except OSError:
+            pass
+    return seeds
+
+
+GEN_SYSTEM = (
+    "You write a short, self-contained Python 3 program that GENERATES valid "
+    "and boundary-case binary inputs for a C parser's fuzz harness. The program "
+    "takes one argument, an output directory, and writes each seed as a separate "
+    "file there. It must compute any checksums, digests, lengths or magic values "
+    "the format requires so the inputs pass the parser's header gates, and it "
+    "must include at least one input that drives the main count/length field well "
+    "past any fixed buffer size. Use only the Python standard library. No network, "
+    "no input(), no deletion — only write files into sys.argv[1].")
+
+
+def llm_generator_seeds(task: "config.Task", client: "llm.LLMClient",
+                        work_dir: str) -> Tuple[List[bytes], str]:
+    """Ask the model for a generator PROGRAM (Trail-of-Bits style), run it, and
+    return its seeds. Falls back to ([], 'n/a') when no model is available —
+    the heuristic byte seeds still cover discovery."""
+    out_dir = os.path.join(work_dir, "gen")
+    harness = util.read_text(task.harness)
+    src = "\n\n".join("/* %s */\n%s" % (config.rel_to_root(task, s), util.read_text(s))
+                      for s in task.sources)
+    prompt = ("Target: %s\n\n=== HARNESS ===\n%s\n\n=== SOURCE ===\n%s\n\n"
+              "Write the generator program now. Output ONLY the Python code in one "
+              "fenced block." % (task.description, harness, src[:6000]))
+    try:
+        text = client.complete(prompt, system=GEN_SYSTEM, max_tokens=1200)
+    except llm.LLMUnavailable:
+        return [], "n/a"
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
+    code = m.group(1) if m else text
+    if "argv" not in code:
+        return [], "n/a"
+    try:
+        seeds = _run_generator_program(code, out_dir)
+    except Exception:
+        return [], "n/a"
+    return seeds, (client.last_source if seeds else "n/a")
+
+
+def generator_seeds(task: "config.Task", client: "llm.LLMClient",
+                    work_dir: str) -> Tuple[List[bytes], str]:
+    """Seed via a generator PROGRAM: the live model writes one; otherwise a
+    generator program shipped with the task (its cached, offline-safe form) is
+    run. Returns ([], "n/a") when neither is available."""
+    seeds, src = llm_generator_seeds(task, client, work_dir)
+    if seeds:
+        return seeds, "generator(" + src + ")"
+    if task.seed_generator and os.path.exists(task.seed_generator):
+        try:
+            code = util.read_text(task.seed_generator)
+            seeds = _run_generator_program(code, os.path.join(work_dir, "gen"))
+            if seeds:
+                return seeds, "generator(provided)"
+        except Exception:
+            pass
+    return [], "n/a"
+
+
 def llm_seeds(task: "config.Task", client: "llm.LLMClient") -> Tuple[List[bytes], str]:
     """One LLM turn for structured seeds; heuristic fallback. Returns
     (seeds, source) where source is 'live'/'cache'/'offline-heuristic'."""

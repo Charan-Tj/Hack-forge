@@ -113,6 +113,21 @@ def _finding_card(f: Dict) -> str:
             bits.append('<a class="dl-link ok" href="%s" target="_blank">&#128190; fix.patch '
                         '(fix + test)</a>' % _e(pb["patch"]))
         deliver = '<h4>Merge-ready deliverables</h4><div class="deliver">%s</div>' % " ".join(bits)
+    ens = ""
+    cs = f.get("candidates")
+    if cs and len(cs) > 1:
+        rows = []
+        for c in cs:
+            mark = " &#9733;" if c.get("chosen") else ""
+            st = c.get("status", "")
+            cls = "ok" if st == "Verified" else ("" if c.get("chosen") else "no")
+            rows.append("<tr class='%s'><td>%s%s</td><td>%s</td><td>%s</td><td>%d</td><td>%s</td></tr>"
+                        % (cls, _e(c.get("label","")), mark, _e(c.get("strategy","")),
+                           _e(st), c.get("distance",0), c.get("added_lines",0)))
+        ens = ("<h4>Patch ensemble &mdash; ranked by root-cause proximity</h4>"
+               "<table class='ens'><tr><th>candidate</th><th>strategy</th><th>result</th>"
+               "<th>dist&nbsp;to&nbsp;root</th><th>+lines</th></tr>%s</table>"
+               % "".join(rows))
     return """
     <div class="card">
       <div class="chead">
@@ -140,6 +155,7 @@ def _finding_card(f: Dict) -> str:
           <div class="rc">%s</div>
           %s
           %s
+          %s
           <h4>Verification gates</h4>
           <div class="gates">%s</div>
           %s
@@ -154,7 +170,7 @@ def _finding_card(f: Dict) -> str:
         _e(f.get("pov_hexdump", "")),
         _e(f.get("asan_report", "")),
         _e(patch.get("source", "")), _e(patch.get("rationale", "")),
-        reflect, diff_block, gates, deliver)
+        reflect, diff_block, ens, gates, deliver)
 
 
 def _risk_rows(ledger: List[Dict]) -> str:
@@ -363,7 +379,7 @@ pre.hex{max-height:150px}pre.asan{max-height:230px;white-space:pre-wrap}
 .gate.ok{background:#12361f;color:var(--ok);border-color:#1f5e36}
 .gate.no{background:#3a1b22;color:var(--bad);border-color:#5e1f2c}
 .reflect{color:var(--mut);font-size:12px;margin:6px 0}
-.deliver{display:flex;flex-wrap:wrap;gap:6px}
+.deliver{display:flex;flex-wrap:wrap;gap:6px}\ntable.ens{margin:4px 0 2px}table.ens td,table.ens th{padding:4px 8px;font-size:12px}table.ens tr.ok td{color:var(--ok)}table.ens tr.no td{color:var(--mut)}
 .dl-link{display:inline-block;border:1px solid var(--line);border-radius:6px;padding:4px 9px;font-size:12px;color:var(--mut)}
 .dl-link.ok{color:var(--ok);border-color:#1f5e36}
 .dl-link:hover{border-color:var(--acc);color:var(--tx)}

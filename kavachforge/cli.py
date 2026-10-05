@@ -21,7 +21,7 @@ import threading
 from . import __version__, config, report, toolchain, util
 from .pipeline import run_task
 
-TASKS = ["tinyimg", "recordcfg", "cleanjson"]
+TASKS = ["tinyimg", "recordcfg", "sigpkt", "cleanjson"]
 ART = "artifacts"
 
 
@@ -278,6 +278,39 @@ def _cmd_reset(args) -> int:
     return 0
 
 
+def _cmd_harness(args) -> int:
+    from . import harness, llm
+    src = args.source
+    if not os.path.exists(src):
+        cand = os.path.join("targets", args.source, "src")
+        if os.path.isdir(cand):
+            cs = [f for f in os.listdir(cand) if f.endswith(".c")]
+            if cs:
+                src = os.path.join(cand, cs[0])
+    if not os.path.exists(src):
+        util.bad("source not found: %s" % args.source); return 1
+    include_dir = args.include or os.path.dirname(src)
+    name = args.name or os.path.splitext(os.path.basename(src))[0]
+    client = llm.LLMClient(provider=args.provider, budget=args.budget) if args.provider != "none" else None
+    util.stage("Harness synthesis \u2014 %s" % src)
+    syn = harness.synthesize(src, include_dir, name, client=client)
+    if syn.candidates:
+        util.info("entry-point candidates:")
+        for e in syn.candidates[:5]:
+            util.step("%-20s %-10s score=%d" % (e.name, e.shape, e.score))
+    if not syn.harness_path:
+        util.bad(syn.detail); return 1
+    (util.good if syn.validated else util.warn)(syn.detail)
+    util.good("harness : %s" % os.path.relpath(syn.harness_path))
+    util.good("probe   : %s" % os.path.relpath(syn.probe_path))
+    util.good("task    : %s" % os.path.relpath(syn.task_path))
+    if syn.validated:
+        util.info("run it:  ./kavach run %s" % name)
+        if args.run:
+            return _run_many([name], args, provider=(None if args.provider=="none" else args.provider))
+    return 0 if syn.validated else 2
+
+
 def _cmd_ci(args) -> int:
     from . import ci
     if args.provider:
@@ -344,6 +377,22 @@ def main(argv=None) -> int:
     sp = sub.add_parser("reset", help="restore a watched target to its baseline")
     sp.add_argument("task", nargs="?", default="cleanjson")
     sp.set_defaults(func=_cmd_reset)
+
+    sp = sub.add_parser("harness", help="synthesize & validate a fuzz harness "
+                        "for an unfuzzed C source")
+    sp.add_argument("source", help="path to a .c file, or a target name under targets/")
+    sp.add_argument("--include", default=None, help="include dir (default: source's dir)")
+    sp.add_argument("--name", default=None, help="task name (default: source stem)")
+    sp.add_argument("--run", action="store_true", help="run the loop after synthesis")
+    sp.add_argument("--provider", default="none", help="model for synthesis (default none=template)")
+    sp.add_argument("--model", default=None)
+    sp.add_argument("--budget", type=int, default=6)
+    sp.add_argument("--engine", choices=["libfuzzer","standalone"], default=None)
+    sp.add_argument("--keep", action="store_true")
+    sp.add_argument("--uplift", action="store_true")
+    sp.add_argument("--diff", default=None)
+    sp.add_argument("--sarif", default=None)
+    sp.set_defaults(func=_cmd_harness)
 
     sp = sub.add_parser("ci", help="pull-request check: run on changed targets, "
                         "write a summary, emit fix patches, set exit code")

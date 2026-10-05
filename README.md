@@ -13,14 +13,31 @@ KavachForge turns a suspicious code change or a scanner alert into an **auditabl
                   ─▶ LLM patch (self-reflect) ─▶ build + PoV-replay + tests ─▶ signed evidence
 ```
 
-### Three hard gates (the whole point)
-- **No finding without a reproducible proof-of-vulnerability (PoV).** Every crash is re-run in a fresh process before it counts; duplicates are collapsed by normalized stack signature (e.g. **46 raw crashes → 1 finding**).
-- **No "fix" until it is proven.** A patch is `Verified` only after it **applies**, **rebuilds**, makes the **PoV no longer crash**, and **passes the regression suite** — all in a clean, disposable worktree.
-- **No fix without a guard against regression.** The PoV becomes a permanent regression test, and the test is itself proven (fails unpatched, passes patched) before it ships in the PR.
+### The evidence gates (the whole point)
+Nothing is a finding without a reproducible PoV (re-run in a fresh process; duplicates collapsed by normalized stack signature — e.g. **47 raw crashes → 1 finding**). A patch is `Verified` only after **six** executable gates pass in a clean, disposable worktree:
+
+| Gate | Proves |
+|---|---|
+| G0 | the patch applies |
+| G1 | the target rebuilds |
+| G2 | the exact PoV no longer crashes |
+| G3 | the existing regression suite still passes |
+| **G4** | a regression test generated from the PoV crashes the unpatched tree and passes the patched tree |
+| **G5** | **behaviour preserved** — the whole corpus replayed through a behaviour probe produces byte-identical results on every previously-valid input (catches the >40% of patches that pass "PoC + tests" but silently change behaviour) |
+
+Several candidate patches are generated per finding (different strategies), all run through the gates, and the survivor **closest to the root cause** is chosen.
 
 This is the AIxCC pattern (LLM + fuzzing + deterministic validation), deliberately narrowed so the full loop is credible and reliable live.
 
 ---
+
+## What's in it
+- **Discovery:** coverage-guided libFuzzer (or a portable standalone ASan engine), seeded by structure-aware byte seeds **and model-written generator programs** that solve checksum/digest gates a fuzzer cannot (see the `sigpkt` target: seeded 0.1s vs. nothing in 20s unaided).
+- **Triage:** fresh-run reproduction, normalized stack-signature dedup, CWE + severity (read/write aware).
+- **Repair:** a **patch ensemble** (model strategies + a deterministic brain) ranked by root-cause proximity, with a static policy gate and self-reflection.
+- **Proof:** six gates G0–G5, a generated+proven regression test, and a tamper-evident evidence bundle (sha256 manifest, run log, prompt log).
+- **Delivery:** a merge-ready PR bundle per fix, a **GitHub Actions workflow** (`kavach ci`) that comments on PRs and opens an automatic fix-PR, and **automatic harness synthesis** (`kavach harness`) for unfuzzed C sources.
+- **Live:** `showcase` (watch gates go green) and `watch` (a judge breaks a target, it heals itself).
 
 ## Guides
 - **[docs/RUN_AND_TEST.md](docs/RUN_AND_TEST.md)** — install on any OS, every command, what each prints, the three levels of testing, troubleshooting.

@@ -151,3 +151,19 @@ crash — point out that this is the no-false-positive guarantee working.
 Numbers from a reference run (libFuzzer engine): time to first PoV ≈ 0.1 s; ~45 raw
 crashes → 1 finding per target; 2 patches Verified with G4 proven; control target 10M+
 execs with 0 findings; 27/27 unit tests.
+
+---
+
+## 6. v1.3 extra segments (pick per audience)
+
+**Seed generator vs. a gate a fuzzer can't crack (~45s).**
+`./kavach run sigpkt --uplift`. sigpkt's header carries an FNV-1a digest. Point at the uplift line: **seeded ≈ 0.1s, unseeded = no crash in 20s**. Say: "The model writes a small program that computes the digest and generates valid inputs. Coverage-guided fuzzing alone cannot solve a 32-bit keyed checksum — this is the honest, measured difference the LLM makes."
+
+**Harness synthesis on an unfuzzed library (~45s).**
+`./kavach harness urlparse --run`. Say: "This C file shipped with no harness. KavachForge finds the parser entry point, writes a libFuzzer harness, validates that it compiles and runs cleanly, then finds and fixes two out-of-bounds writes." (Addresses the PRD's one explicit non-goal.)
+
+**Patch ensemble + behaviour gate (point at any finding card).**
+"It doesn't write one patch — it writes several (validate-at-read, guard-at-use, clamp), runs all of them through every gate, and picks the one closest to the root cause. Gate G5 replays hundreds of valid inputs through a behaviour probe; a patch that silently changes any of them is rejected. Published research found 40% of patches that pass 'PoC + tests' are still wrong — G5 is exactly that check."
+
+**CI integration (if you have network + the repo open).**
+Open a PR that deletes a bounds check → the KavachForge Action comments a summary table, fails the check, and opens a `kavachforge/fix-*` PR with the fix + regression test. Say: "This is the whole loop wired into a real pull-request workflow."

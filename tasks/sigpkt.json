@@ -1,0 +1,38 @@
+{
+  "name": "sigpkt",
+  "language": "c",
+  "description": "Digest-gated packet parser (FNV-1a checksum gate + CWE-787)",
+  "root": "targets/sigpkt",
+  "sources": [
+    "src/sigpkt.c"
+  ],
+  "include_dirs": [
+    "src"
+  ],
+  "harness": "harness/fuzz_sigpkt.c",
+  "probe": "harness/probe_sigpkt.c",
+  "test_sources": [
+    "src/sigpkt.c",
+    "tests/test_sigpkt.c"
+  ],
+  "patch_scope": [
+    "src/sigpkt.c"
+  ],
+  "magic": "SPK1",
+  "diff_changed": [
+    "src/sigpkt.c"
+  ],
+  "static_alerts": [
+    {
+      "file": "src/sigpkt.c",
+      "line": 48,
+      "rule": "CWE-787: write to fixed 32-entry table indexed by attacker-controlled n_fields"
+    }
+  ],
+  "budgets": {
+    "time_budget_s": 20,
+    "max_iters": 120000,
+    "rng_seed": 1337
+  },
+  "seed_generator": "gen/generate.py"
+}

@@ -245,3 +245,59 @@ class TestSelfHealing(unittest.TestCase):
         s = util.read_text(p)
         self.assertIn("LLVMFuzzerTestOneInput(kPoV_KV_T_001", s)
         self.assertIn("0x54, 0x49, 0x4d, 0x47", s)   # "TIMG"
+
+
+class TestNewFeatures(unittest.TestCase):
+    def test_differential_kind(self):
+        from kavachforge import differential as d
+        self.assertEqual(d._kind("exit=0 rc=0 x=1", "CRASH"), "new fault")
+        self.assertEqual(d._kind("exit=0 rc=0 x=1", "exit=0 rc=0 x=2"), "result changed")
+        self.assertEqual(d._kind("exit=0 rc=0 x=1", "exit=0 rc=-1"), "accepted/rejected flipped")
+        self.assertEqual(d._kind("exit=0 rc=-2", "exit=0 rc=-1"), "error code changed")
+
+    def test_ensemble_variants_distinct(self):
+        t = config.load_task("recordcfg")
+        f = verifier.Finding(id="x", signature="s", asan_class="heap-buffer-overflow",
+                             cwe="CWE-787", cwe_name="n", severity="Critical", access="Write 33B",
+                             crash_file="recordcfg.c:54", crash_func="recordcfg_parse")
+        vs = patcher.synth_variants(t, f)
+        self.assertGreaterEqual(len(vs), 2)
+        str=[v.strategy for v in vs]
+        self.assertIn("use-site", [v.strategy for v in vs])
+        # root-cause candidate should sit closer to the assignment than the use-site one
+        bylabel = {v.strategy: v for v in vs}
+        if "root-cause" in bylabel and "use-site" in bylabel:
+            self.assertLessEqual(bylabel["root-cause"].distance, bylabel["use-site"].distance)
+
+    def test_rank_prefers_verified_then_distance(self):
+        a = patcher.PatchResult("", "", "h", 1, "", [], label="far", strategy="use-site", distance=9)
+        b = patcher.PatchResult("", "", "h", 1, "", [], label="near", strategy="root-cause", distance=1)
+        order = sorted([a, b], key=lambda p: patcher.rank_key(p, True))
+        self.assertEqual(order[0].label, "near")
+        order2 = sorted([a, b], key=lambda p: patcher.rank_key(p, p is b))  # only b verified
+        self.assertEqual(order2[0].label, "near")
+
+    def test_ci_rebase_patch(self):
+        from kavachforge import ci
+        diff = "--- a/src/x.c\n+++ b/src/x.c\n@@ -1 +1,2 @@\n a\n+b\n"
+        r = ci._rebase_patch(diff, "targets/mylib")
+        self.assertIn("--- a/targets/mylib/src/x.c", r)
+        self.assertIn("+++ b/targets/mylib/src/x.c", r)
+
+    def test_harness_analyze_ranks_buf_size(self):
+        from kavachforge import harness
+        src = os.path.join(ROOT, "targets", "urlparse", "src", "urlparse.c")
+        es = harness.analyze(src)
+        self.assertTrue(es)
+        self.assertEqual(es[0].name, "urlparse")
+        self.assertEqual(es[0].shape, "buf_size")
+
+    def test_generator_program_runs(self):
+        from kavachforge import discovery
+        t = config.load_task("sigpkt")
+        import tempfile
+        seeds = discovery._run_generator_program(util.read_text(t.seed_generator),
+                                                  tempfile.mkdtemp())
+        self.assertTrue(any(s[:4] == b"SPK1" for s in seeds))
+        # a generated seed must satisfy the parser's digest gate (first 9 bytes header)
+        self.assertTrue(any(len(s) >= 9 for s in seeds))

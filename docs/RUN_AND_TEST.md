@@ -297,3 +297,18 @@ may edit — harness, tests and flags are off-limits by policy.
 - Model output is treated as untrusted text; only a fixed command template is executed.
 - API keys are read from the environment and never written to logs or evidence.
 - Every patch is a recommendation for human review. KavachForge does not deploy.
+
+---
+
+## 10. v1.3 features & commands
+
+| Command | What it does |
+|---|---|
+| `./kavach ci [--base REF] [--all] [--fail-on any\|unverified\|none]` | Pull-request check: runs on the targets a change touched (via `git diff REF...HEAD`), writes `artifacts/ci-summary.md` (PR comment), emits repo-root fix patches to `artifacts/ci-fix/`, and sets the exit code. |
+| `./kavach harness <src-or-target> [--run] [--provider ...]` | Discovers a fuzzable entry point in an unfuzzed C source, synthesizes + validates a libFuzzer harness and a task, then (with `--run`) runs the loop. |
+
+**GitHub Actions:** `.github/workflows/kavachforge.yml` installs the toolchain, runs `doctor` + `selftest`, runs `kavach ci`, uploads the evidence bundles, comments the summary on the PR, and opens a `kavachforge/fix-*` PR when a verified fix exists. Set the repo secret `ANTHROPIC_API_KEY` to use a live model; otherwise it runs offline. For the auto fix-PR, enable *Settings → Actions → General → Allow GitHub Actions to create and approve pull requests*.
+
+**New gates in the loop:** G4 (regression test generated from the PoV, proven on both trees) and G5 (behaviour preservation — the corpus is replayed through a behaviour `probe` on the unpatched vs patched tree; any changed result on a previously-valid input rejects the patch). Each finding now runs a **patch ensemble**: multiple candidates, all gated, the one closest to the root cause wins (shown in `evidence.json` under `candidates`).
+
+**New targets:** `sigpkt` (FNV-1a digest-gated — shows the seed-generator cracking a gate the fuzzer can't; run `./kavach run sigpkt --uplift`), and `urlparse` (unfuzzed — use `./kavach harness urlparse --run`).

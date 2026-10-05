@@ -180,9 +180,16 @@ def run_task(task_path: str, out_root: str = "artifacts",
             util.plain(e.log[-800:])
             raise
         util.good("built discovery binary (%s engine)" % tc.engine)
-        seeds, seed_src = discovery.llm_seeds(task, client)
-        util.good("%d seeds ready (%s); magic gate: %s"
-                  % (len(seeds), seed_src, task.magic or "none"))
+        gen_seeds, gen_src = discovery.generator_seeds(task, client, work_dir)
+        byte_seeds, seed_src = discovery.llm_seeds(task, client)
+        seeds = gen_seeds + byte_seeds
+        if gen_seeds:
+            util.good("%d generator seeds (%s) + %d byte seeds (%s); gate: %s"
+                      % (len(gen_seeds), gen_src, len(byte_seeds), seed_src, task.magic or "none"))
+            seed_src = gen_src
+        else:
+            util.good("%d seeds ready (%s); magic gate: %s"
+                      % (len(seeds), seed_src, task.magic or "none"))
         P.disc_stats = {"engine": tc.engine, "seed_source": seed_src,
                         "seeds": len(seeds)}
         P.set("build", "done")

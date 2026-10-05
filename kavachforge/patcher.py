@@ -199,21 +199,26 @@ def synth_variants(task: "config.Task", finding: "verifier.Finding") -> List[Pat
     if mm:
         dst, length = mm.group(1).strip(), mm.group(2).strip()
         field = dst.split("->")[-1].split(".")[-1].strip()
-        fm = re.search(r"\b%s\s*\[\s*(\w+)\s*\]" % re.escape(field), text)
+        # capacity = a DECLARATION "field[CAP]" where CAP is a macro or integer
+        # literal (never a lowercase index variable such as the length itself).
+        fm = re.search(r"\b%s\s*\[\s*([A-Z_][A-Z0-9_]*|\d+)\s*\]" % re.escape(field), text)
         capname = fm.group(1) if fm else (_macro_value_name(text, []) or "sizeof(%s)" % dst)
+        # if the buffer is also written at [length] (a null terminator), the
+        # safe bound is >= capacity, not > capacity.
+        term = bool(re.search(r"\b%s\s*\[\s*%s\s*\]\s*=" % (re.escape(field), re.escape(length)), body))
+        op = ">=" if term else ">"
         free_m = re.search(r"free\s*\(\s*(\w+)\s*\)", body)
         cleanup = ("free(%s); " % free_m.group(1)) if free_m else ""
         use_i = next((i for i in range(lo, min(hi + 1, len(lines))) if "memcpy(" in lines[i]), None)
         root = _first_assignment_line(lines, lo, hi, length)
         if use_i is not None:
-            g = "%sif (%s > %s) { %s%s }\n" % (indent_of(use_i), length, capname, cleanup, err_ret)
+            g = "%sif (%s %s %s) { %s%s }\n" % (indent_of(use_i), length, op, capname, cleanup, err_ret)
             out.append(_make_result(lines, rel, use_i, g, "length check at copy site", "use-site",
                                     root, "Reject records whose declared length exceeds the "
                                     "fixed field capacity, immediately before the copy."))
             if root and root - 1 != use_i and lo <= root - 1 <= hi:
-                # root-cause site: right after the length is read from input
-                ins = root            # insert AFTER the assignment line (0-based idx = root)
-                g2 = "%sif (%s > %s) { %s%s }\n" % (indent_of(root - 1), length, capname, cleanup, err_ret)
+                ins = root
+                g2 = "%sif (%s %s %s) { %s%s }\n" % (indent_of(root - 1), length, op, capname, cleanup, err_ret)
                 out.append(_make_result(lines, rel, ins, g2, "length check where length is read",
                                         "root-cause", root,
                                         "Validate the declared length at the point it is read "
