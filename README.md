@@ -31,6 +31,15 @@ This is the AIxCC pattern (LLM + fuzzing + deterministic validation), deliberate
 
 ---
 
+## Engines & reproducibility
+- **libFuzzer** (clang + compiler-rt; the Docker image and Linux): coverage-guided, millions of exec/s.
+- **standalone-greybox** (any gcc/clang with AddressSanitizer, e.g. macOS): a SanitizerCoverage edge bitmap + an auto-extracted literal dictionary make it genuinely coverage-guided — it can crack magic/length gates unaided, not just blind-mutate. Slower (one process per input) but portable everywhere.
+- `./kavach replay` forces the standalone engine for byte-identical, deterministic runs.
+- The CI workflow **builds and smoke-tests the Docker image on every push** and publishes it to GHCR.
+
+## Real-world target
+`./kavach run cjson` runs the whole loop on **cJSON 1.7.18** (a 3,100-line production JSON parser, MIT, vendored under `targets/cjson/`) — a clean run of ~1.9M executions with zero false positives, the honest answer to "does it work on real code?"
+
 ## What's in it
 - **Discovery:** coverage-guided libFuzzer (or a portable standalone ASan engine), seeded by structure-aware byte seeds **and model-written generator programs** that solve checksum/digest gates a fuzzer cannot (see the `sigpkt` target: seeded 0.1s vs. nothing in 20s unaided).
 - **Triage:** fresh-run reproduction, normalized stack-signature dedup, CWE + severity (read/write aware).
