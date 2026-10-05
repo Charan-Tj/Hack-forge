@@ -12,7 +12,7 @@ import os
 import random
 import re
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from . import config, llm, toolchain, util
 
@@ -231,10 +231,59 @@ def _asan_env(rss_mb: int) -> Dict[str, str]:
                             % rss_mb}
 
 
-def _run_one(fuzzer_bin: str, path: str, rss_mb: int) -> "util.CmdResult":
+def _run_one(fuzzer_bin: str, path: str, rss_mb: int, extra_env=None) -> "util.CmdResult":
     """Execute one input through the harness with memory/CPU/wall limits."""
-    return util.run([fuzzer_bin, path], env=_asan_env(rss_mb), timeout=20,
-                    cpu_seconds=15)
+    env = _asan_env(rss_mb)
+    if extra_env:
+        env.update(extra_env)
+    return util.run([fuzzer_bin, path], env=env, timeout=20, cpu_seconds=15)
+
+
+def _read_cov(path: str):
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def extract_dictionary(task: "config.Task") -> List[bytes]:
+    """Tokens a blind mutator would never guess, harvested from the target's
+    own source: string literals (magic strings, separators), char literals,
+    and notable integer constants in 1/2/4-byte little-endian form. Same idea
+    as libFuzzer's -dict, built automatically."""
+    toks: List[bytes] = []
+    seen = set()
+
+    def add(b: bytes):
+        if b and len(b) <= 32 and b not in seen:
+            seen.add(b)
+            toks.append(b)
+
+    for path in list(task.sources) + [task.harness]:
+        try:
+            text = util.read_text(path)
+        except OSError:
+            continue
+        for m in re.finditer(r'"((?:[^"\\]|\\.){1,32})"', text):
+            try:
+                add(m.group(1).encode("latin-1").decode("unicode_escape").encode("latin-1"))
+            except Exception:
+                add(m.group(1).encode("latin-1", "ignore"))
+        for m in re.finditer(r"\b(0x[0-9a-fA-F]{2,8}|[1-9][0-9]{0,6})\b", text):
+            try:
+                v = int(m.group(1), 0)
+            except ValueError:
+                continue
+            if v <= 0xFF:
+                add(bytes([v]))
+            if v <= 0xFFFF:
+                add(v.to_bytes(2, "little"))
+            if v <= 0xFFFFFFFF:
+                add(v.to_bytes(4, "little"))
+    if task.magic:
+        add(task.magic.encode("latin-1"))
+    return toks[:256]
 
 
 # ---------------------------------------------------------------------------
@@ -252,11 +301,21 @@ def _write_corpus(corpus_dir: str, seeds: List[bytes], provided: List[str]) -> N
                 dst.write(src.read())
 
 
-def _mutate(rng: random.Random, data: bytes, corpus: List[bytes]) -> bytes:
+def _mutate(rng: random.Random, data: bytes, corpus: List[bytes],
+            dictionary=None) -> bytes:
     b = bytearray(data)
-    op = rng.randint(0, 7)
+    op = rng.randint(0, 9 if dictionary else 7)
     if not b:
         b = bytearray(rng.randbytes(4))
+    if op >= 8 and dictionary:                          # dictionary token splice
+        tok = rng.choice(dictionary)
+        if op == 8:                                     # overwrite at offset
+            i = rng.randrange(len(b) + 1)
+            b[i:i + len(tok)] = tok
+        else:                                           # insert (often as prefix)
+            i = 0 if rng.random() < 0.35 else rng.randrange(len(b) + 1)
+            b[i:i] = tok
+        return bytes(b[:MAX_INPUT])
     if op == 0 and b:                                   # bit flip
         i = rng.randrange(len(b)); b[i] ^= 1 << rng.randrange(8)
     elif op == 1 and b:                                 # byte set extreme
@@ -354,59 +413,79 @@ def _run_standalone(task, fuzzer_bin, corpus_dir, crashes_dir, seeds, max_crashe
         with open(os.path.join(corpus_dir, name), "rb") as f:
             corpus.append(f.read())
 
+    dictionary = extract_dictionary(task)
     cand_path = os.path.join(crashes_dir, "_candidate")
+    cov_path = os.path.join(crashes_dir, "_cov")
     execs = 0
     deadline = t0 + task.time_budget_s
     crashes: List[Dict] = []
     first_s = None
     how = "standalone"
+    global_edges = set()        # union of all edges seen (coverage feedback)
+    coverage_on = bool(getattr(task, "_cov", True))
+    new_edge_hits = 0
 
     def try_input(data: bytes):
-        nonlocal execs
+        """Run one input. Returns a crash dict, "new" if it reached a new
+        edge (greybox feedback), or None."""
+        nonlocal execs, new_edge_hits
         with open(cand_path, "wb") as f:
             f.write(data)
         execs += 1
-        res = _run_one(fuzzer_bin, cand_path, task.rss_mb)
+        env = {"KV_COV_OUT": cov_path}
+        res = _run_one(fuzzer_bin, cand_path, task.rss_mb, env)
         if _is_crash(res):
             sha = util.sha256_bytes(data)[:16]
             cp = os.path.join(crashes_dir, "crash-" + sha)
             with open(cp, "wb") as f:
                 f.write(data)
             return {"input_path": cp, "asan_text": res.err + res.out}
+        cov = _read_cov(cov_path)
+        if cov:
+            edges = frozenset(i for i, v in enumerate(cov) if v)
+            if not edges <= global_edges:
+                global_edges.update(edges)
+                new_edge_hits += 1
+                return "new"
         return None
 
     # 1) seeds / provided corpus directly (structure-aware inputs first)
     for data in corpus:
         hit = try_input(data)
-        if hit:
+        if isinstance(hit, dict):
             crashes.append(hit)
             if first_s is None:
                 first_s, how = round(time.time() - t0, 2), "standalone(seed)"
             if len(crashes) >= max_crashes:
                 break
 
-    # 2) mutational loop: continue after a crash to harvest more candidates,
-    #    but stop early once enough are collected or the budget is spent.
+    # 2) greybox mutational loop: a mutant that reaches a NEW edge is kept in
+    #    the corpus (coverage-guided), so the fuzzer climbs through gated
+    #    branches instead of mutating blindly.
     harvest_deadline = min(deadline, time.time() + 4) if crashes else deadline
     while (execs < task.max_iters and time.time() < harvest_deadline
            and len(crashes) < max_crashes):
         base = rng.choice(corpus)
-        data = _mutate(rng, base, corpus)
+        data = _mutate(rng, base, corpus, dictionary)
         hit = try_input(data)
-        if hit:
+        if isinstance(hit, dict):
             crashes.append(hit)
             if first_s is None:
                 first_s, how = round(time.time() - t0, 2), "standalone(mutation)"
-                harvest_deadline = min(deadline, time.time() + 4)
-        elif execs % 500 == 0:
-            corpus.append(_mutate(rng, rng.choice(corpus), corpus))
+            harvest_deadline = min(deadline, time.time() + 4)
+        elif hit == "new" and coverage_on:
+            corpus.append(data)          # favored: it unlocked new coverage
 
     try:
         os.remove(cand_path)
+        os.remove(cov_path)
     except OSError:
         pass
+    eng = how
+    if coverage_on and how.startswith("standalone") and global_edges:
+        eng = how.replace("standalone", "standalone-greybox")
     return {"crashes": crashes,
-            "stats": {"engine": how, "seconds": round(time.time() - t0, 2),
+            "stats": {"engine": eng, "seconds": round(time.time() - t0, 2),
                       "execs": execs, "corpus_seeds": len(corpus),
                       "first_crash_s": first_s, "raw_crashes": len(crashes)}}
 
@@ -440,22 +519,32 @@ def measure_uplift(task: "config.Task", tc: "toolchain.Toolchain",
     else:
         rng = random.Random(task.rng_seed + 1)
         corpus = [rng.randbytes(16), b"\x00" * 16, b"\xff" * 16]
+        dictionary = extract_dictionary(task)
         cand = os.path.join(adir, "_c")
+        cov = os.path.join(adir, "_cov")
+        edges = set()
         deadline = t0 + budget_s
         while time.time() < deadline and execs < task.max_iters:
-            data = _mutate(rng, rng.choice(corpus), corpus)
+            data = _mutate(rng, rng.choice(corpus), corpus, dictionary)
             with open(cand, "wb") as f:
                 f.write(data)
             execs += 1
-            res = _run_one(fuzzer_bin, cand, task.rss_mb)
+            res = _run_one(fuzzer_bin, cand, task.rss_mb, {"KV_COV_OUT": cov})
             if _is_crash(res):
                 found = round(time.time() - t0, 2)
                 break
-            if execs % 300 == 0:
+            c = _read_cov(cov)
+            if c:                                   # greybox: keep new-coverage inputs
+                e = frozenset(i for i, v in enumerate(c) if v)
+                if not e <= edges:
+                    edges.update(e)
+                    corpus.append(data)
+            elif execs % 300 == 0:
                 corpus.append(data)
+    greybox = bool(tc.is_libfuzzer or getattr(tc, "cov_flag", ""))
     return {"budget_s": budget_s, "execs": execs,
             "first_crash_s": found,
             "note": ("coverage-guided engine cracked the format gate unaided"
-                     if found is not None and tc.is_libfuzzer else
-                     "no crash without structure-aware seeds within budget"
-                     if found is None else "mutation found it unaided")}
+                     if found is not None and greybox else
+                     "mutation found it unaided" if found is not None else
+                     "no crash without structure-aware seeds within budget")}

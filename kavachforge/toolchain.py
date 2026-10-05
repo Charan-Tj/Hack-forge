@@ -38,14 +38,37 @@ class Toolchain:
     engine: str          # "libfuzzer" | "standalone"
     cc: str              # compiler binary
     note: str            # human description
+    cov_flag: str = ""   # SanitizerCoverage flag for the standalone engine, if any
 
     @property
     def is_libfuzzer(self) -> bool:
         return self.engine == "libfuzzer"
 
 
+# Common out-of-PATH LLVM installs that ship compiler-rt + libFuzzer. On macOS
+# Apple's clang has no libFuzzer, but `brew install llvm` does - detecting it
+# gives the coverage-guided engine natively without Docker.
+_LLVM_CANDIDATES = [
+    "/opt/homebrew/opt/llvm/bin/clang",      # Apple-silicon Homebrew
+    "/usr/local/opt/llvm/bin/clang",         # Intel-mac Homebrew
+    "/home/linuxbrew/.linuxbrew/opt/llvm/bin/clang",
+    "/usr/lib/llvm-18/bin/clang", "/usr/lib/llvm-17/bin/clang",
+    "/usr/lib/llvm-19/bin/clang", "/usr/lib/llvm-20/bin/clang",
+]
+
+
+def _clang_candidates() -> List[str]:
+    out = []
+    env = os.environ.get("KAVACH_CC")
+    if env:
+        out.append(env)
+    out.append("clang")
+    out += [p for p in _LLVM_CANDIDATES if os.path.exists(p)]
+    return out
+
+
 def _can_compile(cc: str, extra: List[str]) -> bool:
-    if shutil.which(cc) is None:
+    if not (os.path.isabs(cc) and os.path.exists(cc)) and shutil.which(cc) is None:
         return False
     tmp = tempfile.mkdtemp(prefix="kv_probe_")
     try:
@@ -67,17 +90,25 @@ def detect(prefer: Optional[str] = None) -> Toolchain:
     want = prefer or os.environ.get("KAVACH_ENGINE")
 
     if want in (None, "libfuzzer"):
-        if _can_compile("clang", ["-fsanitize=fuzzer,address"]):
-            return Toolchain("libfuzzer", "clang",
-                             "clang libFuzzer + AddressSanitizer (coverage-guided)")
+        for cc in _clang_candidates():
+            if _can_compile(cc, ["-fsanitize=fuzzer,address"]):
+                label = "clang" if cc == "clang" else cc
+                return Toolchain("libfuzzer", cc,
+                                 "%s libFuzzer + AddressSanitizer (coverage-guided)" % label)
         if want == "libfuzzer":
             util.warn("libFuzzer requested but clang/compiler-rt unavailable; "
                       "falling back")
 
     for cc in ("clang", "gcc", "cc"):
         if _can_compile(cc, ["-fsanitize=address"]):
-            return Toolchain("standalone", cc,
-                             "%s + AddressSanitizer (standalone mutational)" % cc)
+            cov = ""
+            for flag in ("-fsanitize-coverage=trace-pc-guard", "-fsanitize-coverage=trace-pc"):
+                if _can_compile(cc, ["-fsanitize=address", flag]):
+                    cov = flag
+                    break
+            note = ("%s + AddressSanitizer (standalone, %s)"
+                    % (cc, "coverage-guided" if cov else "blind mutational"))
+            return Toolchain("standalone", cc, note, cov)
 
     raise RuntimeError(
         "No usable C sanitizer toolchain found. Install clang+compiler-rt or "
@@ -94,7 +125,7 @@ def build_fuzzer_cmd(tc: Toolchain, sources: List[str], harness: str,
         san = ["-fsanitize=fuzzer,address"]
         extra_src: List[str] = []
     else:
-        san = ["-fsanitize=address"]
+        san = ["-fsanitize=address"] + ([tc.cov_flag] if tc.cov_flag else [])
         extra_src = [STANDALONE_MAIN]
     return [tc.cc] + BASE_FLAGS + san + inc + sources + [harness] + extra_src + \
            ["-o", out_bin]

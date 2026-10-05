@@ -1,0 +1,28 @@
+{
+  "name": "cjson",
+  "language": "c",
+  "description": "cJSON 1.7.18 \u2014 real-world open-source JSON parser (MIT, vendored)",
+  "root": "targets/cjson",
+  "sources": [
+    "src/cJSON.c"
+  ],
+  "include_dirs": [
+    "src"
+  ],
+  "harness": "harness/fuzz_cjson.c",
+  "probe": "harness/probe_cjson.c",
+  "test_sources": [],
+  "patch_scope": [
+    "src/cJSON.c"
+  ],
+  "magic": null,
+  "static_alerts": [],
+  "seeds": [
+    "seeds/valid.json",
+    "seeds/array.json"
+  ],
+  "budgets": {
+    "time_budget_s": 40,
+    "rng_seed": 1337
+  }
+}

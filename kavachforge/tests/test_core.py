@@ -326,3 +326,22 @@ class TestManifest(unittest.TestCase):
         for e in man["files"]:
             h = hashlib.sha256(open(os.path.join(d, e["path"]), "rb").read()).hexdigest()
             self.assertEqual(h, e["sha256"])
+
+
+class TestRealWorldTarget(unittest.TestCase):
+    def test_cjson_task_loads_and_ranks(self):
+        t = config.load_task("cjson")
+        self.assertTrue(t.sources and t.sources[0].endswith("cJSON.c"))
+        ledger = risk.analyze(t, util.read_text(t.harness))
+        self.assertTrue(ledger)  # finds fuzzable functions in real code
+
+    def test_cjson_dictionary_nonempty(self):
+        from kavachforge import discovery
+        t = config.load_task("cjson")
+        self.assertTrue(len(discovery.extract_dictionary(t)) > 0)
+
+    def test_standalone_cov_flag_detected(self):
+        from kavachforge import toolchain
+        tc = toolchain.detect("standalone")
+        # On clang/gcc with SanitizerCoverage, the engine is greybox-capable.
+        self.assertIn(tc.engine, ("standalone", "libfuzzer"))

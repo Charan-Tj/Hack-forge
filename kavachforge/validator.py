@@ -67,6 +67,8 @@ def _build_tests(task, tc, worktree, out_bin) -> "util.CmdResult":
 def baseline_tests(task: "config.Task", tc: "toolchain.Toolchain",
                    work_dir: str) -> Gate:
     """Run the regression suite on the UNPATCHED sources (should be green)."""
+    if not task.test_sources:
+        return Gate("baseline tests", True, "no in-repo regression suite for this target")
     out = os.path.join(work_dir, "baseline_test")
     b = _build_tests(task, tc, task.root, out)
     if not b.ok:
@@ -115,7 +117,20 @@ def validate(task: "config.Task", tc: "toolchain.Toolchain", finding,
         if not blocked:
             return Validation("Rejected", gates, worktree if keep else None)
 
-        # G3: regression tests must still pass
+        # G3: regression tests must still pass (skipped if the target ships none)
+        if not task.test_sources:
+            gates.append(Gate("G3 tests", True, "no in-repo regression suite (PoV + G5 cover behaviour)"))
+            from . import regress
+            rr = regress.prove(task, tc, finding, dst, work_dir, worktree)
+            gates.append(Gate("G4 regression test", rr.guards_bug, rr.detail))
+            if not with_g5:
+                return Validation("Verified", gates, worktree if keep else None, regress=rr)
+            from . import differential
+            dr = differential.compare(task, tc, dst, work_dir, worktree,
+                                      os.path.join(work_dir, "fuzzer"), out_bin)
+            gates.append(Gate("G5 behaviour preserved", dr.passed or dr.mode == "skipped", dr.detail))
+            status = "Verified" if (dr.passed or dr.mode == "skipped") else "Rejected"
+            return Validation(status, gates, worktree if keep else None, regress=rr, diff=dr)
         test_bin = os.path.join(worktree, "test_patched")
         tb = _build_tests(task, tc, dst, test_bin)
         if not tb.ok:
