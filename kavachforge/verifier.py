@@ -55,9 +55,12 @@ def _extract_frames(blob: str, source_basenames) -> List[Dict]:
     frames = []
     for m in _FRAME_RE.finditer(blob):
         func, path, line = m.group(2), m.group(3), int(m.group(4))
-        frames.append({"func": func, "file": os.path.basename(path),
-                       "line": line, "in_target":
-                       os.path.basename(path) in source_basenames})
+        base = os.path.basename(path)
+        # The KavachForge driver/probe frames are harness scaffolding, never
+        # the vulnerability — never treat them as the in-target crash site.
+        scaffold = base.startswith("kv_standalone_main") or base.startswith("probe_")
+        frames.append({"func": func, "file": base, "line": line,
+                       "in_target": (base in source_basenames) and not scaffold})
     return frames
 
 
@@ -101,7 +104,16 @@ def verify(task: "config.Task", fuzzer_bin: str,
         op = _OP_RE.search(blob)
         access = ("%s %sB" % (op.group(1).title(), op.group(2))) if op else "n/a"
         cls = cwe.classify(asan_class, access)
-        site = next((f for f in frames if f["in_target"]), frames[0] if frames else None)
+        # Crash site: first in-target frame; else the first non-scaffold,
+        # non-system frame (so a huge stack-overflow trace attributes to the
+        # library, not the driver or libc); else the top frame.
+        def _nonscaffold(f):
+            b = f["file"]
+            return not (b.startswith("kv_standalone_main") or b.startswith("probe_")
+                        or b.startswith("fuzz_") or "/" in b and b.endswith(".h"))
+        site = (next((f for f in frames if f["in_target"]), None)
+                or next((f for f in frames if _nonscaffold(f)), None)
+                or (frames[0] if frames else None))
         with open(pov, "rb") as f:
             data = f.read()
 
