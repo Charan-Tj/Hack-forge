@@ -31,19 +31,32 @@ static uint8_t kv_cov_map[KV_MAP_SIZE];
 static uint32_t kv_guard_count = 0;
 static uintptr_t kv_prev = 0;
 
+/* The coverage callbacks must NOT themselves be coverage-instrumented, or a
+ * compiler that instruments every function (gcc's -fsanitize-coverage=trace-pc)
+ * makes them call themselves on every edge -> infinite recursion -> stack
+ * overflow. Exclude them explicitly (clang and gcc spell the attribute
+ * differently). */
+#if defined(__clang__)
+#define KV_NOCOV __attribute__((no_sanitize("coverage")))
+#elif defined(__GNUC__) && (__GNUC__ >= 12)
+#define KV_NOCOV __attribute__((no_sanitize_coverage))
+#else
+#define KV_NOCOV
+#endif
+
 /* clang: one guard per edge, numbered at init. */
-void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+KV_NOCOV void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
     if (start == stop || *start) return;
     for (uint32_t *g = start; g < stop; g++) *g = ++kv_guard_count;
 }
-void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
+KV_NOCOV void __sanitizer_cov_trace_pc_guard(uint32_t *guard) {
     uint32_t id = *guard;
     if (!id) return;
     kv_cov_map[id & (KV_MAP_SIZE - 1)] = 1;
 }
 
 /* gcc: raw PC per edge; hash (prev,cur) AFL-style. */
-void __sanitizer_cov_trace_pc(void) {
+KV_NOCOV void __sanitizer_cov_trace_pc(void) {
     uintptr_t pc = (uintptr_t)__builtin_return_address(0);
     uintptr_t h = (pc >> 4) ^ (kv_prev << 1);
     kv_cov_map[h & (KV_MAP_SIZE - 1)] = 1;

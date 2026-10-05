@@ -101,7 +101,18 @@ def _probe_coverage(cc: str) -> str:
         for flag in ("-fsanitize-coverage=trace-pc-guard", "-fsanitize-coverage=trace-pc"):
             r = util.run([cc] + BASE_FLAGS + ["-fsanitize=address", flag,
                           stub, STANDALONE_MAIN, "-o", out])
-            if r.ok and os.path.exists(out):
+            if not (r.ok and os.path.exists(out)):
+                continue
+            # Must also RUN cleanly on a trivial input: if instrumentation makes
+            # the driver itself fault (e.g. a compiler that instruments the
+            # coverage callbacks into self-recursion), reject this flag and fall
+            # back to blind mutation rather than report phantom crashes.
+            probe_in = os.path.join(tmp, "in")
+            util.write_text(probe_in, "x")
+            rr = util.run([out, probe_in],
+                          env={"ASAN_OPTIONS": "detect_leaks=0", "KV_COV_OUT": os.path.join(tmp, "c")},
+                          timeout=10, cpu_seconds=8)
+            if rr.ok and not ("AddressSanitizer" in (rr.err + rr.out)):
                 return flag
             try:
                 os.remove(out)
