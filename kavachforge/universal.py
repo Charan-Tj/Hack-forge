@@ -360,6 +360,32 @@ BUILTIN_RULES = [
 ]
 
 
+_C_STYLE = {"javascript", "typescript", "java", "kotlin", "c", "cpp", "csharp", "php", "go", "rust", "scala", "swift"}
+
+
+def _block_comment_mask(lines: List[str], lang: str) -> List[bool]:
+    """True for lines that lie entirely inside a /* ... */ block comment, so
+    commented-out example code (e.g. NodeGoat's documented fixes) is not
+    reported - and cannot keep a correct patch failing the G2 re-scan."""
+    mask = [False] * len(lines)
+    if lang not in _C_STYLE:
+        return mask
+    inside = False
+    for i, line in enumerate(lines):
+        if inside:
+            mask[i] = True
+            if "*/" in line:
+                inside = False
+                # code after the closing marker on the same line is live
+                mask[i] = not line.split("*/", 1)[1].strip()
+            continue
+        start = line.find("/*")
+        if start != -1 and "*/" not in line[start + 2:]:
+            inside = True
+            mask[i] = not line[:start].strip()
+    return mask
+
+
 def run_builtin(root: str, files: List[str]) -> List[SFinding]:
     out: List[SFinding] = []
     for rel in files:
@@ -371,12 +397,19 @@ def run_builtin(root: str, files: List[str]) -> List[SFinding]:
         except Exception:
             continue
         lines = text.splitlines()
+        in_block = _block_comment_mask(lines, lang)
         for langs, pat, cwe_id, name, sev, msg, fix in BUILTIN_RULES:
             if lang not in langs:
                 continue
             for i, line in enumerate(lines):
-                if line.lstrip().startswith(("//", "#", "*", "/*")):
-                    continue
+                if in_block[i] or line.lstrip().startswith(("//", "#", "*", "/*")):
+                    stripped = line.lstrip()
+                    if not stripped.startswith("/*"):
+                        continue
+                    end = stripped.find("*/", 2)
+                    if end < 0:
+                        continue
+                    line = stripped[end + 2:]
                 if re.search(pat, line):
                     snippet = "\n".join("%5d  %s" % (j + 1, lines[j]) for j in range(max(0, i - 2), min(len(lines), i + 3)))
                     out.append(SFinding(id="", rule=re.sub(r"\W+", "-", name.lower()), cwe=cwe_id, cwe_name=name,
@@ -447,7 +480,7 @@ class Candidate:
 
 def _unified(rel: str, before: str, after: str) -> str:
     import difflib
-    rel = rel.replace(os.sep, "/")
+    rel = rel.replace("\\", "/")
     return "".join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
                                         fromfile="a/" + rel, tofile="b/" + rel, n=3))
 
@@ -994,7 +1027,8 @@ def _http_snapshot(task) -> Dict:
         login_path = login.get("path", "/login")
         _, login_body = _http_request(task, jar, limiter, "GET", login_path)
         parser = _CsrfParser(); parser.feed(login_body)
-        data = {"username": login.get("user", ""), "password": login.get("password", "")}
+        data = {login.get("user_field", "username"): login.get("user", ""),
+                login.get("password_field", "password"): login.get("password", "")}
         if parser.token:
             data["_csrf"] = parser.token
         _http_request(task, jar, limiter, "POST", login_path, data)
