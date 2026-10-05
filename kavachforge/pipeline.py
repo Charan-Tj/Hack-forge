@@ -25,12 +25,22 @@ STAGES = [
 ]
 
 
+STAGES_UNIVERSAL = [
+    ("risk", "Stack & surface"),
+    ("discover", "Static discovery"),
+    ("verify", "Triage & dedup"),
+    ("repair", "Repair, approve & verify"),
+    ("evidence", "Evidence bundle"),
+]
+
+
 class _Progress:
     """Tracks stage status and republishes the evidence bundle on change."""
 
-    def __init__(self, task, tc, client, work_dir):
+    def __init__(self, task, tc, client, work_dir, stages=None):
         self.task, self.tc, self.client, self.work_dir = task, tc, client, work_dir
-        self.status = {k: "pending" for k, _ in STAGES}
+        self.stages = stages or STAGES
+        self.status = {k: "pending" for k, _ in self.stages}
         self.ledger: List[Dict] = []
         self.disc_stats: Dict = {}
         self.findings: List[Dict] = []
@@ -64,7 +74,7 @@ class _Progress:
             {"live": self.client.calls, "cached": self.client.cached,
              "budget": self.client.budget})
         ev["stages"] = [{"key": k, "label": lbl, "status": self.status[k]}
-                        for k, lbl in STAGES]
+                        for k, lbl in self.stages]
         ev["run_status"] = self.run_status
         ev["error"] = self.error
         ev["uplift"] = self.uplift
@@ -143,11 +153,65 @@ def _write_manifest(work_dir: str) -> str:
     return man["bundle_sha256"]
 
 
+class _NoToolchain:
+    note = "static analysis (no compiler needed)"
+
+
+def run_universal(task, work_dir: str, client, approve: str = "critical",
+                  interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
+                  deps: bool = False) -> Dict:
+    """Any-stack track: static discovery -> repair ensemble -> approval -> gates."""
+    from . import universal
+    P = _Progress(task, _NoToolchain(), client, work_dir, stages=STAGES_UNIVERSAL)
+    util.info("track     : universal (static analysis + model repair + test/rescan gates)")
+    util.info("model     : %s" % client.describe())
+    P.publish()
+    try:
+        P.set("risk", "running")
+        res = universal.run(task, client, work_dir, approve=approve, interactive=interactive,
+                            scanner=scanner, max_findings=max_findings, publish=P.publish, progress=P,
+                            deps=deps)
+        P.ledger = res["risk_ledger"]
+        P.disc_stats = res["discovery"]
+        P.findings = res["findings"]
+        P.first_pov = res["metrics"]["time_to_first_pov"]
+        for k in ("risk", "discover", "verify", "repair"):
+            P.status[k] = "done"
+        util.stage("Evidence bundle")
+        P.set("evidence", "running")
+        P.run_status = "done"
+        P.set("evidence", "done")
+        bundle_sha = _write_manifest(work_dir)
+        paths = P.publish()
+        m = res["metrics"]
+        util.good("findings: %d   verified patches: %d   skipped by reviewer: %d"
+                  % (m["unique_findings"], m["verified_patches"], m["skipped_by_reviewer"]))
+        util.good("evidence : %s" % paths["json"])
+        util.good("dashboard: %s" % paths["html"])
+        util.good("manifest : bundle sha256 %s" % bundle_sha[:16])
+        util.info(util.dim("total %.1fs | LLM live calls %d / budget %d"
+                           % (time.time() - P.t0, client.calls, client.budget)))
+        ev = P.evidence()
+        ev["metrics"].update(m)
+        return {"evidence": ev, "paths": paths, "metrics": ev["metrics"]}
+    except Exception as e:
+        P.run_status = "error"
+        P.error = "%s: %s" % (type(e).__name__, e)
+        util.bad(P.error)
+        util.plain(util.dim(traceback.format_exc()[-600:]))
+        P.publish()
+        raise
+    finally:
+        util.set_log_file(None)
+
+
 def run_task(task_path: str, out_root: str = "artifacts",
              provider=None, model=None, budget: int = 6,
              engine_pref=None, keep_worktree: bool = False,
              uplift: bool = False, diff: Optional[str] = None,
-             sarif: Optional[str] = None) -> Dict:
+             sarif: Optional[str] = None, approve: str = "critical",
+             interactive: bool = True, scanner: str = "auto",
+             max_findings: int = 12, deps: bool = False) -> Dict:
     task = config.load_task(task_path, diff_override=diff, sarif_override=sarif)
     work_dir = os.path.join(out_root, task.name)
     os.makedirs(work_dir, exist_ok=True)
@@ -156,6 +220,12 @@ def run_task(task_path: str, out_root: str = "artifacts",
 
     util.plain(util.bold("\nKavachForge — target: %s" % task.name))
     util.info(util.dim(task.description))
+
+    if task.kind == "universal":
+        client = llm.LLMClient(provider=provider, model=model, budget=budget,
+                               cache_dir="cache/llm", log_dir=os.path.join(work_dir, "llm_log"))
+        return run_universal(task, work_dir, client, approve=approve, interactive=interactive,
+                             scanner=scanner, max_findings=max_findings, deps=deps)
 
     tc = toolchain.detect(engine_pref)
     client = llm.LLMClient(provider=provider, model=model, budget=budget,

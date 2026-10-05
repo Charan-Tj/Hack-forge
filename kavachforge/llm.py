@@ -33,8 +33,32 @@ class LLMUnavailable(Exception):
 DEFAULT_MODELS = {
     "anthropic": "claude-3-5-sonnet-20241022",
     "openai": "gpt-4o-mini",
-    "ollama": "llama3.1",
+    "ollama": "qwen2.5-coder:7b",
 }
+
+
+def _ollama_running() -> bool:
+    """A local Ollama server with at least one model counts as a provider
+    (fully offline operation). Checked once, cheaply."""
+    import urllib.request
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(host + "/api/tags", timeout=1.5) as r:
+            import json as _j
+            return bool(_j.loads(r.read().decode()).get("models"))
+    except Exception:
+        return False
+
+
+def ollama_models() -> list:
+    import urllib.request
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(host + "/api/tags", timeout=1.5) as r:
+            import json as _j
+            return [m["name"] for m in _j.loads(r.read().decode()).get("models", [])]
+    except Exception:
+        return []
 
 
 class LLMClient:
@@ -45,6 +69,11 @@ class LLMClient:
                          or self._auto_provider())
         self.model = (model or os.environ.get("KAVACH_LLM_MODEL")
                       or DEFAULT_MODELS.get(self.provider, ""))
+        if self.provider == "ollama" and not model and not os.environ.get("KAVACH_LLM_MODEL"):
+            have = ollama_models()
+            if have and not any(h.split(":")[0] == self.model.split(":")[0] for h in have):
+                pref = [h for h in have if "coder" in h or "qwen" in h or "devstral" in h or "deepseek" in h]
+                self.model = (pref or have)[0]
         self.budget = int(os.environ.get("KAVACH_LLM_BUDGET", budget))
         self.cache_dir = cache_dir
         self.log_dir = log_dir
@@ -60,7 +89,7 @@ class LLMClient:
             return "anthropic"
         if os.environ.get("OPENAI_API_KEY"):
             return "openai"
-        if os.environ.get("KAVACH_USE_OLLAMA"):
+        if os.environ.get("KAVACH_USE_OLLAMA") or _ollama_running():
             return "ollama"
         return "offline"
 
@@ -151,9 +180,12 @@ class LLMClient:
                 host.rstrip("/") + "/api/chat",
                 {"content-type": "application/json"},
                 {"model": self.model, "stream": False,
+                 "options": {"temperature": 0, "num_predict": max_tokens,
+                             "num_ctx": int(os.environ.get("KAVACH_OLLAMA_CTX", "8192"))},
                  "messages": [{"role": "system", "content":
                                system or "You are a precise security engineer."},
-                              {"role": "user", "content": prompt}]})
+                              {"role": "user", "content": prompt}]},
+                timeout=int(os.environ.get("KAVACH_OLLAMA_TIMEOUT", "900")))   # CPU inference is slow
             return out["message"]["content"]
 
         raise LLMUnavailable("unknown provider %r" % self.provider)

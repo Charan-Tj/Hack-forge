@@ -128,6 +128,14 @@ def _finding_card(f: Dict) -> str:
                "<table class='ens'><tr><th>candidate</th><th>strategy</th><th>result</th>"
                "<th>dist&nbsp;to&nbsp;root</th><th>+lines</th></tr>%s</table>"
                % "".join(rows))
+    static = f.get("kind") == "static"
+    lbl_site, lbl_pov, lbl_rep = (("Location", "Flagged code", "Analyzer finding") if static
+                                  else ("Crash site", "Proof-of-vulnerability", "Sanitizer report"))
+    pov_line = ("rule: <code>%s</code>%s" % (_e(f.get("asan_class")),
+                " &nbsp;&middot;&nbsp; <b style='color:#d9822b'>critical area — human approval</b>" if f.get("critical") else "")
+                if static else
+                "%d bytes &middot; sha256 <code>%s</code><br>repro: <code>%s</code>"
+                % (f.get("pov_size", 0), _e(f.get("pov_sha256", ""))[:32], _e(f.get("repro_cmd", ""))))
     return """
     <div class="card">
       <div class="chead">
@@ -141,13 +149,13 @@ def _finding_card(f: Dict) -> str:
       <div class="meta2">%s &nbsp;|&nbsp; access: %s &nbsp;|&nbsp; signature <code>%s</code>%s</div>
       <div class="grid">
         <div class="col">
-          <h4>Crash site</h4>
+          <h4>%s</h4>
           <div class="crash">%s in <code>%s</code></div>
           <div class="frames">%s</div>
-          <h4>Proof-of-vulnerability</h4>
-          <div class="pov">%d bytes &middot; sha256 <code>%s</code><br>repro: <code>%s</code></div>
+          <h4>%s</h4>
+          <div class="pov">%s</div>
           <pre class="hex">%s</pre>
-          <h4>Sanitizer report</h4>
+          <h4>%s</h4>
           <pre class="asan">%s</pre>
         </div>
         <div class="col">
@@ -165,10 +173,10 @@ def _finding_card(f: Dict) -> str:
         _e(f["id"]), color, color, _e(f.get("cwe")), _e(f.get("cwe_name")),
         color, _e(sev), vcls, vtxt,
         _e(f.get("asan_class")), _e(f.get("access")), _e(f.get("signature")), dup_txt,
-        _e(f.get("crash_file")), _e(f.get("crash_func")), frames,
-        f.get("pov_size", 0), _e(f.get("pov_sha256", ""))[:32], _e(f.get("repro_cmd", "")),
+        lbl_site, _e(f.get("crash_file")), _e(f.get("crash_func")), frames,
+        lbl_pov, pov_line,
         _e(f.get("pov_hexdump", "")),
-        _e(f.get("asan_report", "")),
+        lbl_rep, _e(f.get("asan_report", "")),
         _e(patch.get("source", "")), _e(patch.get("rationale", "")),
         reflect, diff_block, ens, gates, deliver)
 
@@ -204,6 +212,11 @@ def render_html(ev: Dict) -> str:
     live = ev.get("run_status") == "running"
     if findings:
         cards = "".join(_finding_card(f) for f in findings)
+    elif ev.get("run_status") == "done" and str(d.get("engine", "")).startswith("static"):
+        cards = ('<div class="card"><div class="verdict ok2">NO FINDING</div>'
+                 '<p class="muted">Static analysis (%s) over %s file(s) reported nothing; '
+                 'KavachForge did not invent a finding.</p></div>'
+                 % (_e(d.get("note", "")), "{:,}".format(d.get("files", 0))))
     elif ev.get("run_status") == "done":
         cards = ('<div class="card"><div class="verdict ok2">NO VERIFIED CRASH</div>'
                  '<p class="muted">Within the bounded run (%s execs on %s), KavachForge '
@@ -222,8 +235,10 @@ def render_html(ev: Dict) -> str:
         stat("raw crashes → unique", "%d → %d" % (raw, len(findings))),
         stat("verified patches", n_verified),
         stat("unverified alerts", 0),
-        stat("time to 1st PoV", m.get("time_to_first_pov", "n/a")),
-        stat("fuzz execs", "{:,}".format(d.get("execs", 0))),
+        stat("time to 1st PoV" if not str(d.get("engine", "")).startswith("static") else "time to 1st finding",
+             m.get("time_to_first_pov", "n/a")),
+        stat("fuzz execs", "{:,}".format(d.get("execs", 0))) if not str(d.get("engine", "")).startswith("static")
+        else stat("files scanned", "{:,}".format(d.get("files", 0))),
         stat("LLM calls", "%s / %s" % (ev["llm_calls"].get("live", 0),
                                        ev["llm_calls"].get("budget", 0))),
     ])

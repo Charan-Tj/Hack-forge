@@ -52,6 +52,7 @@ class Task:
     probe: Optional[str] = None     # absolute path to behaviour probe main, optional
     seed_generator: Optional[str] = None  # absolute path to a seed-generator program, optional
     link_flags: List[str] = field(default_factory=list)  # extra linker flags, e.g. ['-lm']
+    kind: str = "fuzz"              # "fuzz" (C/C++ sanitizer track) | "universal" (any stack, static)
 
     # budgets / limits (with defaults)
     time_budget_s: int = 60
@@ -112,11 +113,11 @@ def load_task(path: str, diff_override: Optional[str] = None,
         name=d["name"],
         language=d.get("language", "c"),
         root=root,
-        sources=[_abs(root, s) for s in d["sources"]],
-        harness=_abs(root, d["harness"]),
+        sources=[_abs(root, s) for s in d.get("sources", [])],
+        harness=(_abs(root, d["harness"]) if d.get("harness") else ""),
         include_dirs=[_abs(root, i) for i in d.get("include_dirs", ["."])],
         test_sources=[_abs(root, s) for s in d.get("test_sources", [])],
-        patch_scope=[_abs(root, s) for s in d.get("patch_scope", d["sources"])],
+        patch_scope=[_abs(root, s) for s in d.get("patch_scope", d.get("sources", []))],
         magic=d.get("magic"),
         diff_changed=diff_changed,
         static_alerts=static_alerts,
@@ -129,6 +130,7 @@ def load_task(path: str, diff_override: Optional[str] = None,
         probe=(_abs(root, d["probe"]) if d.get("probe") else None),
         seed_generator=(_abs(root, d["seed_generator"]) if d.get("seed_generator") else None),
         link_flags=list(d.get("link_flags", [])),
+        kind=d.get("kind", "fuzz"),
         time_budget_s=int(budgets.get("time_budget_s", 60)),
         max_iters=int(budgets.get("max_iters", 200000)),
         rss_mb=int(budgets.get("rss_mb", 2048)),

@@ -175,5 +175,15 @@ normal loop runs. Rehearsed offline on parson, sds, cJSON; with a model on jsmn 
 If a repo cannot be onboarded, the last line says exactly why — read it out loud; honesty
 about a callback-style API is worth more than a fake success.
 
+**Any-stack repo with a local model, fully offline (~4 minutes).**
+Wi-Fi off. `./kavach onboard <their repo> --run --provider ollama`. Narrate: "No C here, so
+the fuzzer has no oracle; KavachForge switches to the universal track: 16 cached rule packs,
+26 results, 11 unique findings ranked by CWE severity." When it pauses — **APPROVAL REQUIRED,
+touches a critical area** — pick a candidate out loud: "It never patches a request handler,
+auth or crypto file without a human; and it offers alternatives, not one answer." Then read the
+gates: syntax, re-scan (finding gone, nothing new), tests (or honest 'not runnable: needs
+MongoDB'), proof test (claimed only if it discriminates). Close with: "The model is a 7B coder
+running on this laptop; everything you saw works with the network cable unplugged."
+
 **CI integration (if you have network + the repo open).**
 Open a PR that deletes a bounds check → the KavachForge Action comments a summary table, fails the check, and opens a `kavachforge/fix-*` PR with the fix + regression test. Say: "This is the whole loop wired into a real pull-request workflow."

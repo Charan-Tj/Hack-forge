@@ -442,3 +442,89 @@ class TestOnboard(unittest.TestCase):
         v = next(v for v in vs if v.label == "allocate room for terminator")
         self.assertIn("malloc((n * sizeof(char)) + 1)", v.diff)
         self.assertIsNone(patcher.check_policy(task, v.diff))
+
+
+class TestUniversal(unittest.TestCase):
+    """Any-stack track: stack detection, built-in rules, dedupe, mechanical
+    fixes, policy, tolerant model-edit parsing and the syntax/rescan gates -
+    offline, on synthetic repos."""
+
+    def _repo(self):
+        root = tempfile.mkdtemp(prefix="kv_uni_")
+        os.makedirs(os.path.join(root, "app"))
+        util.write_text(os.path.join(root, "package.json"), '{"name":"x","scripts":{}}')
+        util.write_text(os.path.join(root, "app", "auth.js"),
+                        "function login(req, res) {\n"
+                        "  const n = eval(req.body.n);\n"
+                        "  const m = eval(req.body.m);\n"
+                        "  res.cookie('sid', n, { httpOnly: false });\n"
+                        "}\nmodule.exports = login;\n")
+        util.write_text(os.path.join(root, "app", "util.py"),
+                        "import yaml\n\ndef load(t):\n    return yaml.load(t)\n")
+        return root
+
+    def test_detect_and_builtin_rules(self):
+        from kavachforge import universal as u
+        root = self._repo()
+        self.assertEqual(u.detect_stacks(root), ["node"])
+        found, note = u.discover(root, ["node"], scanner="builtin")
+        self.assertIn("built-in", note)
+        cwes = [f.cwe for f in found]
+        self.assertIn("CWE-95", cwes); self.assertIn("CWE-1004", cwes); self.assertIn("CWE-502", cwes)
+        ev = next(f for f in found if f.cwe == "CWE-95")
+        self.assertEqual((ev.line, ev.end_line, ev.duplicates), (2, 3, 1))   # two evals, one finding
+        self.assertTrue(ev.critical)                                          # auth.js is a critical area
+        self.assertEqual(found[0].severity, "Critical")                       # ranked first
+
+    def test_mechanical_fix_and_gates(self):
+        from kavachforge import universal as u
+        root = self._repo()
+        found, _ = u.discover(root, ["node"], scanner="builtin")
+        ck = next(f for f in found if f.cwe == "CWE-1004")
+        c = u.mechanical_fix(root, ck)
+        self.assertIsNotNone(c)
+        self.assertIn("+  res.cookie('sid', n, { httpOnly: true });", c.diff)
+        self.assertIsNone(u.check_policy(ck, c.diff))
+        tree = tempfile.mkdtemp(prefix="kv_tree_")
+        u._scratch_copy(root, tree)
+        ok, d = u.g0_apply(tree, c.diff); self.assertTrue(ok, d)
+        ok, d = u.g1_syntax(tree, "app/auth.js"); self.assertTrue(ok, d)
+        ok, d = u.g2_rescan(tree, ck, ["node"], "builtin"); self.assertTrue(ok, d)
+        yl = next(f for f in found if f.cwe == "CWE-502")
+        self.assertIn("yaml.safe_load(", u.mechanical_fix(root, yl).diff)
+
+    def test_policy_rejects_bad_patches(self):
+        from kavachforge import universal as u
+        root = self._repo()
+        f = u.discover(root, ["node"], scanner="builtin")[0][0]
+        other = "--- a/app/other.js\n+++ b/app/other.js\n@@ -1 +1 @@\n-a\n+b\n"
+        self.assertIn("out-of-scope", u.check_policy(f, other))
+        evil = "--- a/%s\n+++ b/%s\n@@ -1 +1,2 @@\n a\n+ child_process.exec(x)\n" % (f.file, f.file)
+        self.assertIn("dangerous", u.check_policy(f, evil))
+
+    def test_model_edit_formats(self):
+        from kavachforge import universal as u
+        root = self._repo()
+        f = next(x for x in u.discover(root, ["node"], scanner="builtin")[0] if x.cwe == "CWE-95")
+        sr = ("<<<<<<< SEARCH\n  const n = eval(req.body.n);\n=======\n"
+              "  const n = parseInt(req.body.n, 10);\n>>>>>>> REPLACE\n")
+        c = u.candidate_from_text(root, f, "parse", sr)
+        self.assertIn("+  const n = parseInt(req.body.n, 10);", c.diff)
+        # indentation drift + line-number prefixes are tolerated
+        drift = ("<<<<<<< SEARCH\n    2  const m = eval(req.body.m);\n=======\n"
+                 "const m = Number(req.body.m);\n>>>>>>> REPLACE\n")
+        c2 = u.candidate_from_text(root, f, "num", drift)
+        self.assertIn("+  const m = Number(req.body.m);", c2.diff)
+        # whole-file answer with line numbers
+        whole = "```js\n" + "\n".join("%5d  %s" % (i + 1, l) for i, l in enumerate(
+            util.read_text(os.path.join(root, f.file)).replace("eval(", "Number(").splitlines())) + "\n```"
+        c3 = u.candidate_from_text(root, f, "whole", whole)
+        self.assertIn("Number(req.body.n)", c3.diff)
+        self.assertIsNone(u.candidate_from_text(root, f, "none", "I cannot help with that."))
+
+    def test_approval_rules(self):
+        from kavachforge import universal as u
+        f = u.SFinding("KV-1", "r", "CWE-95", "Eval", "Critical", "app/auth.js", 1, 1, "", "", critical=True)
+        g = u.SFinding("KV-2", "r", "CWE-601", "Redir", "Medium", "app/x.js", 1, 1, "", "", critical=False)
+        self.assertTrue(u.needs_approval("critical", f)); self.assertFalse(u.needs_approval("critical", g))
+        self.assertTrue(u.needs_approval("all", g)); self.assertFalse(u.needs_approval("auto", f))

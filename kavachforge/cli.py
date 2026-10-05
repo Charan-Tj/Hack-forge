@@ -36,7 +36,12 @@ def _common_kwargs(args, provider=None):
                 keep_worktree=getattr(args, "keep", False),
                 uplift=getattr(args, "uplift", False),
                 diff=getattr(args, "diff", None),
-                sarif=getattr(args, "sarif", None))
+                sarif=getattr(args, "sarif", None),
+                approve=getattr(args, "approve", "critical"),
+                interactive=not getattr(args, "yes", False),
+                scanner=getattr(args, "scanner", "auto"),
+                max_findings=getattr(args, "max_findings", 12),
+                deps=getattr(args, "deps", False))
 
 
 def _run_many(names, args, provider=None, on_each=None) -> int:
@@ -108,6 +113,21 @@ def _cmd_doctor(args) -> int:
     for cc in ("clang", "gcc"):
         util.info("  %s: %s" % (cc, shutil.which(cc) or "not found"))
     util.info("docker: %s" % (shutil.which("docker") or "not found (optional)"))
+    from . import llm, universal
+    if universal.semgrep_available():
+        cp = universal.cached_packs()
+        util.good("semgrep found (universal track)%s" % (
+            "; %d rule pack(s) cached for offline use" % len(cp) if cp else "; no packs cached - run ./kavach prefetch"))
+    else:
+        util.warn("semgrep not found: universal track will use %d built-in patterns (pip install semgrep)"
+                  % len(universal.BUILTIN_RULES))
+    models = llm.ollama_models()
+    if models:
+        util.good("ollama running with local model(s): %s  (offline model available)" % ", ".join(models[:4]))
+    elif shutil.which("ollama"):
+        util.info(util.dim("ollama installed but not serving / no model: run `ollama serve` and ./kavach prefetch"))
+    else:
+        util.info(util.dim("ollama not installed: no local model (optional, https://ollama.com)"))
     for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
         if os.environ.get(k):
             util.good("%s set (live model available)" % k)
@@ -340,10 +360,13 @@ def _cmd_onboard(args) -> int:
     util.stage("Onboarding — %s" % args.repo)
     try:
         ob = onboard.onboard(args.repo, name=args.name, harness_sel=args.harness,
-                             budget_s=args.time, client=client, ref=args.ref, log=util.step)
+                             budget_s=args.time, client=client, ref=args.ref,
+                             mode=args.mode, log=util.step)
     except Exception as e:
         util.bad(str(e)); return 1
     util.info("root     : %s" % ob.root)
+    util.info("track    : %s" % ("universal (any stack: static analysis + model repair)"
+                                 if ob.track == "universal" else "fuzz (C/C++ sanitizer-proven)"))
     if ob.harnesses:
         util.info("harness  : %s%s" % (", ".join(ob.harnesses),
                                        "  (synthesized)" if ob.synthesized else "  (shipped by the repo)"))
@@ -368,6 +391,33 @@ def _cmd_onboard(args) -> int:
         return _run_many(names if args.all_harnesses else names[:1], args,
                          provider=(None if args.provider in (None, "none") else args.provider))
     return 0
+
+
+def _cmd_prefetch(args) -> int:
+    """Everything the offline venue needs, fetched while there is network."""
+    from . import llm, universal
+    util.stage("Prefetch for offline use")
+    rc = 0
+    if universal.semgrep_available():
+        ok, bad = universal.prefetch_packs(log=util.step)
+        (util.good if not bad else util.warn)("semgrep rule packs cached: %d ok, %d failed -> rules/semgrep/" % (ok, bad))
+    else:
+        util.warn("semgrep not installed (pip install semgrep); built-in rules will be used"); rc = 1
+    if shutil.which("ollama"):
+        model = args.model or "qwen2.5-coder:7b"
+        have = llm.ollama_models()
+        if any(h == model or h.split(":")[0] == model.split(":")[0] for h in have):
+            util.good("ollama model present: %s" % model)
+        else:
+            util.step("ollama pull %s (one-time download) ..." % model)
+            r = util.run(["ollama", "pull", model], timeout=3600)
+            (util.good if r.ok else util.bad)("ollama pull %s: %s" % (model, "done" if r.ok else "failed - is `ollama serve` running?"))
+            rc = rc or (0 if r.ok else 1)
+    else:
+        util.info(util.dim("ollama not installed: no local model (https://ollama.com/download); "
+                           "the deterministic offline brain still runs"))
+    util.good("done - KavachForge can now run with no network: ./kavach run <task> --provider ollama")
+    return rc
 
 
 def _cmd_ci(args) -> int:
@@ -396,6 +446,16 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd")
 
     def common(sp, with_provider=True):
+        sp.add_argument("--approve", choices=["critical", "all", "auto"], default="critical",
+                        help="pause for human approval before patching critical areas "
+                             "(default), before every patch, or never")
+        sp.add_argument("--yes", action="store_true", help="unattended: never prompt (auto-approve)")
+        sp.add_argument("--scanner", choices=["auto", "semgrep", "builtin"], default="auto",
+                        help="universal track analyzer")
+        sp.add_argument("--max-findings", type=int, default=12, help="universal track: repair at most N")
+        sp.add_argument("--deps", action="store_true",
+                        help="universal track: install the repo's dependencies first (npm ci / pip -r) "
+                             "so its test suite can run as gate G3")
         sp.add_argument("--model", default=None, help="LLM model id")
         sp.add_argument("--budget", type=int, default=6, help="max live LLM calls")
         sp.add_argument("--engine", choices=["libfuzzer", "standalone"], default=None)
@@ -459,10 +519,16 @@ def main(argv=None) -> int:
     sp.add_argument("--name", default=None, help="task/target name (default: repo name)")
     sp.add_argument("--harness", default=None, help="substring selecting one shipped harness")
     sp.add_argument("--ref", default=None, help="branch or tag to clone (URL repos)")
+    sp.add_argument("--mode", choices=["auto", "fuzz", "universal"], default="auto",
+                    help="auto: fuzz track for C/C++ libraries, universal (static) otherwise")
     sp.add_argument("--time", type=int, default=60, help="fuzzing time budget (s) for the task")
     sp.add_argument("--run", action="store_true", help="run the loop right after onboarding")
     sp.add_argument("--all-harnesses", action="store_true",
                     help="with --run: run every onboarded harness, not just the first")
+    sp.add_argument("--approve", choices=["critical", "all", "auto"], default="critical")
+    sp.add_argument("--yes", action="store_true", help="unattended: never prompt")
+    sp.add_argument("--scanner", choices=["auto", "semgrep", "builtin"], default="auto")
+    sp.add_argument("--max-findings", type=int, default=12)
     sp.add_argument("--provider", default=None, help="model for harness synthesis / repair")
     sp.add_argument("--model", default=None)
     sp.add_argument("--budget", type=int, default=6)
@@ -472,6 +538,11 @@ def main(argv=None) -> int:
     sp.add_argument("--diff", default=None)
     sp.add_argument("--sarif", default=None)
     sp.set_defaults(func=_cmd_onboard)
+
+    sp = sub.add_parser("prefetch", help="cache semgrep rule packs + pull the local model so "
+                        "everything runs offline later")
+    sp.add_argument("--model", default=None, help="ollama model to pull (default qwen2.5-coder:7b)")
+    sp.set_defaults(func=_cmd_prefetch)
 
     sp = sub.add_parser("ci", help="pull-request check: run on changed targets, "
                         "write a summary, emit fix patches, set exit code")

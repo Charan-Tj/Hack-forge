@@ -82,6 +82,7 @@ class Onboarded:
     include_dirs: List[str] = field(default_factory=list)
     link_flags: List[str] = field(default_factory=list)
     built: bool = False
+    track: str = "fuzz"            # "fuzz" | "universal"
     detail: str = ""
     log: List[str] = field(default_factory=list)
     skipped: List[str] = field(default_factory=list)   # test/example/main files (relative)
@@ -560,11 +561,43 @@ def sanity(tc, root: str, kept: List[str], habs: str, incs: List[str],
     return "sanity OK (clean on trivial inputs)"
 
 
+def write_universal_task(name: str, root: str, stacks: List[str], description: str = "") -> str:
+    task = {
+        "name": name, "kind": "universal", "language": ",".join(stacks) or "unknown",
+        "description": description or "%s (onboarded; stacks: %s; static track)" % (
+            os.path.basename(root), ", ".join(stacks) or "unknown"),
+        "root": root if not root.startswith(config.PROJECT_ROOT + os.sep) else rel_proj(root),
+        "stacks": stacks, "sources": [], "patch_scope": [], "test_sources": [],
+        "static_alerts": [], "budgets": {"time_budget_s": 0}, "_onboarded": True,
+    }
+    if os.path.isdir(os.path.join(root, ".git")):
+        task["diff"] = "git"
+    path = os.path.join(config.PROJECT_ROOT, "tasks", "%s.json" % name)
+    util.write_json(path, task)
+    return path
+
+
 def onboard(spec: str, name: Optional[str] = None, harness_sel: Optional[str] = None,
             budget_s: int = 60, tc=None, client=None, ref: Optional[str] = None,
-            log=lambda m: None) -> Onboarded:
+            mode: str = "auto", log=lambda m: None) -> Onboarded:
+    """mode: auto (C/C++ fuzz track when the repo has C/C++ library sources,
+    else the universal static track), fuzz, or universal."""
+    from . import universal
     name, root = fetch(spec, name, ref=ref)
     ob = Onboarded(name=name, root=root)
+    stacks = universal.detect_stacks(root)
+    log("stacks: %s" % (", ".join(stacks) or "none recognised"))
+    if mode == "universal" or (mode == "auto" and "c" not in stacks):
+        if not stacks and not universal.source_files(root):
+            ob.detail = "no source files in a language KavachForge recognises"
+            return ob
+        ob.tasks.append(write_universal_task(name, root, stacks))
+        ob.built = True
+        ob.track = "universal"
+        ob.detail = "universal track: %s; %d source file(s) in scope" % (
+            ", ".join(stacks) or "unknown stack", len(universal.source_files(root)))
+        return ob
+    ob.track = "fuzz"
     tc = tc or toolchain.detect()
     info = scan(root)
     ob.skipped = list(info["skipped"])
@@ -674,4 +707,9 @@ def onboard(spec: str, name: Optional[str] = None, harness_sel: Optional[str] = 
             len(ob.tasks), len(ob.sources), len(ob.dropped))
     elif not ob.detail:
         ob.detail = "no harness could be built against the library"
+    if not ok_any and mode == "auto":
+        log("fuzz track unavailable (%s) - falling back to the universal static track" % ob.detail)
+        ob.tasks.append(write_universal_task(name, root, stacks))
+        ob.built, ob.track = True, "universal"
+        ob.detail += "; universal track task written instead"
     return ob

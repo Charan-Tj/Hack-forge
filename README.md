@@ -49,6 +49,7 @@ This is the AIxCC pattern (LLM + fuzzing + deterministic validation), deliberate
 - **Live:** `showcase` (watch gates go green) and `watch` (a judge breaks a target, it heals itself).
 
 ## Guides
+- **docs/OFFLINE_MODELS.md** — run with no internet: local models by laptop size, `kavach prefetch`, demo-day checklist
 - **[docs/RUN_AND_TEST.md](docs/RUN_AND_TEST.md)** — install on any OS, every command, what each prints, the three levels of testing, troubleshooting.
 - **[docs/JUDGE_DEMO.md](docs/JUDGE_DEMO.md)** — the timed presentation script, the live self-healing closer, likely questions, fallbacks.
 
@@ -177,6 +178,39 @@ What it does, in order — every decision is printed, nothing is guessed silentl
 | emit | `tasks/<name>.json` (one per harness), seeds from any `corpus/`/`seeds/` dir, `diff: git` wired for risk ranking; header-only libraries get a generated translation unit and the header as patch scope |
 
 Validated on repos the project had never seen: **parson, sds, jsmn (header-only), cJSON (shipped harness, straight from GitHub), tinyxml2 (C++, model-written harness)** — and honestly refused on **libpng** offline (callback-based API; needs a model). A planted off-by-one in parson was found in 0.1 s, classified CWE-787, repaired at the allocation (root cause) and proven through all six gates with no hand-written configuration.
+
+### Any stack — the universal track
+
+If the repo is not a C/C++ library (Node, Python, Go, Java, PHP, Ruby, Rust, C#, …) — or if the
+C track cannot build a harness — `kavach onboard` routes it to the **universal track**: the same
+find → patch → prove discipline with different oracles, because those stacks have no sanitizer
+crash to anchor on.
+
+| stage | fuzz track (C/C++) | universal track (any stack) |
+|---|---|---|
+| discover | libFuzzer / standalone + ASan | semgrep (16 rule packs, cached locally — offline) or 26 built-in patterns when semgrep is absent |
+| evidence | PoV input that crashes | exact lines, CWE, severity, analyzer message; one finding per weakness per function |
+| repair | heuristic + model ensemble | mechanical hardening (cookie flags, `safe_load`, TLS verify…) + model ensemble (SEARCH/REPLACE edits, tolerant of small-model output) |
+| G0–G2 | apply · rebuild · PoV blocked | apply · syntax (`node --check`, `py_compile`, `php -l`, `gofmt`…) · **re-scan: finding gone, nothing new** |
+| G3 | repo tests | repo tests — no *new* failure vs. baseline (`npm test`, `pytest`, `go test`, `mvn`, `cargo`); honestly skipped when the suite needs a DB |
+| G4/G5 | regression test proven + behaviour differential | model-written **proof test** that fails unpatched / passes patched — claimed only when it discriminates |
+| approval | `--approve critical` pauses before auth/session/crypto/payment/config files | same; `--approve all` before every patch; `--yes` for unattended |
+
+```bash
+./kavach onboard https://github.com/OWASP/NodeGoat --run --provider ollama   # Node app, local model
+./kavach run nodegoat --approve all                                          # choose every patch yourself
+```
+
+On OWASP NodeGoat (never seen before): 26 analyzer results → 11 unique findings (eval injection,
+hard-coded credentials, open redirect, session config, template XSS…); the eval injection in
+`handleContributionsUpdate` is patched by the local 7B model (two strategies offered, human
+approval requested because it is a request handler) and passes G0–G2; the test suite is
+reported *not runnable here* (needs MongoDB) rather than faked.
+
+### Fully offline
+
+`./kavach prefetch` caches the rule packs and pulls a local model; after that nothing needs
+the network. See **docs/OFFLINE_MODELS.md** for which model fits which laptop.
 
 ### Or write the task by hand
 

@@ -85,13 +85,14 @@ If it prints `ISSUES FOUND`, the line above it says exactly what is missing.
 | `./kavach showcase [task] [--fresh] [--port N]` | Starts the live dashboard **first**, then runs every bundled target (or one). Index + per-target dashboards update after each stage. Stays serving until Ctrl-C. |
 | `./kavach watch <task>` | **Live self-healing mode.** Makes the target a git baseline, runs it once, then re-runs the full loop every time a file under the target is saved (risk ranking driven by the live `git diff`). |
 | `./kavach reset <task>` | Restores a watched target to its baseline (`git checkout` + clean). |
-| `./kavach onboard <url-or-dir> [--run]` | **Bring your own repo.** Clone, scan, build-fix, find or write a harness, emit a task (§7a). |
+| `./kavach onboard <url-or-dir> [--run]` | **Bring your own repo, any stack.** C/C++ → fuzz track (§7a); everything else → universal static track (§7b). |
+| `./kavach prefetch [--model M]` | Cache semgrep rule packs + pull a local Ollama model so later runs need no network (§7c). |
 | `./kavach run <task>` | Full loop on one target, no server. |
 | `./kavach demo` | All three targets, no server. |
 | `./kavach replay [task]` | Deterministic offline run: forces the heuristic brain, no network, no key. Same numbers every time. |
 | `./kavach serve [--port N]` | Serve existing `artifacts/` dashboards only. |
 | `./kavach doctor` | Environment check. |
-| `./kavach selftest [-v]` | 43 unit tests (stdlib `unittest`). |
+| `./kavach selftest [-v]` | 48 unit tests (stdlib `unittest`). |
 | `./kavach list` | List bundled targets, plus onboarded/synthesized ones. |
 | `./kavach clean` | Delete `artifacts/`. |
 
@@ -283,7 +284,28 @@ a model, cJSON ✔ (its own `fuzzing/` harness), tinyxml2 (C++) ✔ with a model
 offline (honest refusal: no byte-buffer entry point). Clones live in
 `targets/_onboarded/` (git-ignored); a generated harness lives in `<repo>/.kavach/`.
 
-### 7b. By hand
+### 7b. Any stack (universal track)
+
+`kavach onboard` picks the track automatically: C/C++ library → fuzz track; anything else
+(or a C repo whose harness cannot be built) → universal track. Force it with `--mode universal`.
+
+```bash
+./kavach onboard https://github.com/OWASP/NodeGoat --run --yes            # unattended
+./kavach onboard ./myapp --run --approve all                               # approve each patch
+./kavach run myapp --provider ollama --deps                                # install deps so G3 (tests) can run
+```
+
+Flags: `--approve critical|all|auto` (default critical), `--yes` (never prompt),
+`--scanner auto|semgrep|builtin`, `--max-findings N` (default 12), `--deps`.
+Read the gates exactly as in the fuzz track; "not runnable here" / "not claimed" are honest
+skips, never passes in disguise.
+
+### 7c. Offline
+
+`./kavach prefetch` once with network (rule packs + local model), then everything runs
+air-gapped. Details and model sizes: docs/OFFLINE_MODELS.md.
+
+### 7d. By hand
 
 Any libFuzzer / OSS-Fuzz-style harness (`LLVMFuzzerTestOneInput`) works. Add
 `tasks/<name>.json`:
