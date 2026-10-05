@@ -5,4 +5,4 @@ minimal patch, and proves the patch holds (builds, blocks the proof-of-
 vulnerability, and passes the regression tests) before reporting it.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"

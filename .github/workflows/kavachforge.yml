@@ -14,8 +14,34 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  packages: write
 
 jobs:
+  docker-image:
+    # Proves the Dockerfile builds and the coverage-guided libFuzzer engine
+    # works inside the image, then publishes it to GHCR so any laptop can
+    # `docker pull` the exact, reproducible toolchain.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t kavachforge:ci .
+      - name: Smoke test inside the image (doctor, selftest, one real run)
+        run: |
+          docker run --rm kavachforge:ci doctor
+          docker run --rm kavachforge:ci selftest
+          docker run --rm kavachforge:ci run tinyimg | tail -20
+      - name: Publish to GHCR (push to main only)
+        if: github.event_name == 'push'
+        run: |
+          echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          IMG=ghcr.io/${{ github.repository_owner }}/kavachforge
+          docker tag kavachforge:ci "${IMG}:latest"
+          docker tag kavachforge:ci "${IMG}:${{ github.sha }}"
+          docker push "${IMG}:latest" && docker push "${IMG}:${{ github.sha }}" \
+            || echo "::warning::GHCR push failed (enable improved container permissions if needed); image still built & tested"
+
   kavachforge:
     runs-on: ubuntu-latest
     timeout-minutes: 20
