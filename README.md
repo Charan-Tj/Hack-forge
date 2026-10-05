@@ -22,6 +22,10 @@ This is the AIxCC pattern (LLM + fuzzing + deterministic validation), deliberate
 
 ---
 
+## Guides
+- **[docs/RUN_AND_TEST.md](docs/RUN_AND_TEST.md)** — install on any OS, every command, what each prints, the three levels of testing, troubleshooting.
+- **[docs/JUDGE_DEMO.md](docs/JUDGE_DEMO.md)** — the timed presentation script, the live self-healing closer, likely questions, fallbacks.
+
 ## The "break it yourself" demo (self-healing, live)
 
 ```bash
