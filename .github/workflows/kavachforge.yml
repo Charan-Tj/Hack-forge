@@ -105,7 +105,7 @@ jobs:
         run: gh pr comment "${{ github.event.pull_request.number }}" --body-file artifacts/ci-summary.md
 
       - name: Open a fix pull request (when a verified fix exists)
-        if: hashFiles('artifacts/ci-fix/*.patch') != ''
+        if: github.event_name == 'pull_request' && hashFiles('artifacts/ci-fix/*.patch') != ''
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
