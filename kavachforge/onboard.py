@@ -235,16 +235,47 @@ def _rank_includes(root: str, dirs: List[str], sources: List[str]) -> List[str]:
     return out[:24]
 
 
-def find_seeds(root: str) -> List[str]:
+_CODE_EXT = (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".py", ".sh", ".cmake", ".md",
+             ".in", ".am", ".ac", ".m4", ".mk", ".o", ".a", ".so", ".txt.in", ".yml", ".yaml",
+             ".toml", ".gitignore", ".pc", ".def", ".rc")
+
+
+def find_seeds(root: str, limit: int = 48) -> List[str]:
+    """Real sample inputs the repo already carries: a corpus/seed directory
+    first, else small data fixtures under tests/examples/testdata (anything
+    that is not source, build or doc). These become fuzzing seeds AND the
+    behaviour-preservation corpus, so they matter twice."""
     for d in SEED_DIRS:
         p = os.path.join(root, d)
-        if os.path.isdir(p):
-            files = [os.path.join(d, f) for f in sorted(os.listdir(p))
-                     if os.path.isfile(os.path.join(p, f))
-                     and os.path.getsize(os.path.join(p, f)) <= 64 * 1024]
-            if files:
-                return files[:40]
-    return []
+        if not os.path.isdir(p) or not ("corpus" in d or "seed" in d):
+            continue
+        files = [os.path.join(d, f) for f in sorted(os.listdir(p))
+                 if os.path.isfile(os.path.join(p, f))
+                 and 0 < os.path.getsize(os.path.join(p, f)) <= 64 * 1024]
+        if files:
+            return files[:limit]
+    out: List[str] = []
+    for d in ("tests", "test", "testdata", "test_data", "examples", "example", "samples",
+              "fuzz", "fuzzing", "data", "fixtures", "resources", "res", "assets"):
+        p = os.path.join(root, d)
+        if not os.path.isdir(p):
+            continue
+        for dp, dns, fns in os.walk(p):
+            dns[:] = sorted(x for x in dns if x not in ("unity", "cmocka", "catch2", "googletest", ".git"))
+            for fn in sorted(fns):
+                fp = os.path.join(dp, fn)
+                low = fn.lower()
+                if low.endswith(_CODE_EXT) or low in ("makefile", "cmakelists.txt", "license", "readme"):
+                    continue
+                try:
+                    sz = os.path.getsize(fp)
+                except OSError:
+                    continue
+                if 0 < sz <= 32 * 1024:
+                    out.append(os.path.relpath(fp, root))
+                if len(out) >= limit:
+                    return out
+    return out
 
 
 # ---------------------------------------------------------------------------

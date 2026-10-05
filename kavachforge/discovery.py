@@ -75,7 +75,30 @@ def synth_seeds(task: "config.Task") -> List[bytes]:
     seeds.append(m + bytes([1, big]))
     seeds.append(m + bytes([big, big, big]))
     seeds.append(m + bytes([1, big]) + bytes([0x44]) * 8)
+    if not task.magic:
+        # Unknown text-ish target (an onboarded repo): add small, VALID
+        # samples of the formats real libraries parse. A blind mutator
+        # cannot invent a quoted string or a tag; a seed that already has
+        # one lets every mutation stay in the interesting region.
+        seeds += TEXT_FORMAT_SEEDS
     return [s[:MAX_INPUT] for s in seeds]
+
+
+TEXT_FORMAT_SEEDS: List[bytes] = [
+    b'{"name":"kavach","n":12,"ok":true,"list":[1,2.5,-3,"x"],"obj":{"k":null}}',
+    b'["a","bb","ccc",{"d":"\\u0041\\n"},[[]],0,1e9]',
+    b'"plain string with \\"escapes\\" and \\u00e9"',
+    b'<?xml version="1.0"?><root a="1"><item id="2">text &amp; more</item><e/></root>',
+    b'<html><body><p class="x">hi</p><!-- c --></body></html>',
+    b'key = value\n[section]\nname = "quoted"\nnum = 42\nlist = [1, 2, 3]\n',
+    b'a,b,c\n1,2,3\n"q,uoted",4.5,-6\n',
+    b'https://user:pw@example.com:8080/path/to?x=1&y=two#frag',
+    b'GET /index.html HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\nabc',
+    b'---\nkey: value\nlist:\n  - one\n  - two\nnested: {a: 1, b: [2, 3]}\n',
+    b'set key "value with spaces" 123 \'single\' \\x41\\x42',
+    b'SGVsbG8gS2F2YWNoRm9yZ2U=',
+    b'-12345.678e-3 0x7fffffff 1e308 NaN',
+]
 
 
 def _parse_llm_seeds(text: str) -> List[bytes]:
