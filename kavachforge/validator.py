@@ -62,19 +62,17 @@ def baseline_tests(task: "config.Task", tc: "toolchain.Toolchain",
 def validate(task: "config.Task", tc: "toolchain.Toolchain", finding,
              patch_diff: str, work_dir: str, keep: bool = False) -> Validation:
     gates: List[Gate] = []
-    worktree = tempfile.mkdtemp(prefix="kv_wt_", dir=work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    worktree = tempfile.mkdtemp(prefix="kv_wt_", dir=os.path.abspath(work_dir))
     try:
         # Clean copy of the target subtree.
         dst = os.path.join(worktree, "tree")
         shutil.copytree(task.root, dst)
 
-        # G0: apply patch
+        # G0: apply patch (absolute paths; -f avoids BSD patch prompts).
         diff_path = os.path.join(worktree, "patch.diff")
         util.write_text(diff_path, patch_diff)
-        ap = util.run(["patch", "-p1", "-i", diff_path], cwd=dst, timeout=30)
-        if not ap.ok:
-            # try -p1 via stdin as a fallback
-            ap = util.run("patch -p1 < " + diff_path, cwd=dst, timeout=30)
+        ap = util.run(["patch", "-p1", "-f", "-i", diff_path], cwd=dst, timeout=30)
         gates.append(Gate("G0 patch applies", ap.ok, (ap.out + ap.err).strip()[-300:]))
         if not ap.ok:
             return Validation("Rejected", gates, worktree if keep else None)
