@@ -223,12 +223,17 @@ def synthesize(source_path: str, include_dir: str, name: str,
         "patch_scope": [os.path.relpath(source_path, root)],
         "diff_changed": [os.path.relpath(source_path, root)],
         "static_alerts": [],
-        "budgets": {"time_budget_s": 20, "rng_seed": 1337},
+        "budgets": {"time_budget_s": 30, "rng_seed": 1337},
         "_synthesized": {"entry": entry.name, "shape": entry.shape, "validated": validated},
     }
     tp = os.path.join(root, "tests", "test_%s.c" % name)
     if os.path.exists(tp):
         task["test_sources"].append(os.path.relpath(tp, root))
+    seeds_dir = os.path.join(root, "seeds")
+    if os.path.isdir(seeds_dir):
+        task["seeds"] = [os.path.relpath(os.path.join(seeds_dir, f), root)
+                         for f in sorted(os.listdir(seeds_dir))
+                         if os.path.isfile(os.path.join(seeds_dir, f))]
     task_path = os.path.join(config.PROJECT_ROOT, "tasks", "%s.json" % name)
     util.write_json(task_path, task)
     return Synth(entry, hpath, ppath, task_path, validated, detail, entries)
