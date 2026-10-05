@@ -345,3 +345,100 @@ class TestRealWorldTarget(unittest.TestCase):
         tc = toolchain.detect("standalone")
         # On clang/gcc with SanitizerCoverage, the engine is greybox-capable.
         self.assertIn(tc.engine, ("standalone", "libfuzzer"))
+
+
+class TestOnboard(unittest.TestCase):
+    """Bring-your-own-repo onboarding: scanning, header-only libraries, the
+    mixed C/C++ build command, entry-point ranking and the heuristic brain's
+    typed bail-outs - all offline, on synthetic repos."""
+
+    def _repo(self):
+        root = tempfile.mkdtemp(prefix="kv_onb_t_")
+        os.makedirs(os.path.join(root, "src")); os.makedirs(os.path.join(root, "tests"))
+        os.makedirs(os.path.join(root, "fuzz"))
+        util.write_text(os.path.join(root, "src", "lib.h"),
+                        "#include <stddef.h>\nint lib_parse(const char *s, size_t n);\n")
+        util.write_text(os.path.join(root, "src", "lib.c"),
+                        '#include "lib.h"\nint lib_parse(const char *s, size_t n){return n>0&&s[0]==\'x\';}\n'
+                        "static int helper(const char *p, size_t n){return 0;}\n"
+                        "#ifdef LIB_TEST_MAIN\nint main(void){return 0;}\n#endif\n")
+        util.write_text(os.path.join(root, "tests", "test_lib.c"), "int main(void){return 0;}\n")
+        util.write_text(os.path.join(root, "fuzz", "fuzz_lib.c"),
+                        '#include <stdint.h>\n#include <stddef.h>\n#include "lib.h"\n'
+                        "int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n){lib_parse((const char*)d,n);return 0;}\n")
+        return root
+
+    def test_scan_classifies_files(self):
+        from kavachforge import onboard
+        info = onboard.scan(self._repo())
+        self.assertEqual(info["sources"], ["src/lib.c"])          # ifdef'd main stays a library file
+        self.assertEqual(info["harnesses"], ["fuzz/fuzz_lib.c"])
+        self.assertIn("tests/test_lib.c", info["skipped"])
+        self.assertIn("src", info["include_dirs"])
+
+    def test_header_only_translation_unit(self):
+        from kavachforge import onboard
+        root = tempfile.mkdtemp(prefix="kv_onb_h_")
+        util.write_text(os.path.join(root, "tiny.h"),
+                        "#ifndef TINY_H\n#define TINY_H\n" + "/* pad */\n" * 120 +
+                        "#ifdef TINY_IMPLEMENTATION\nint tiny_parse(const char *s, size_t n){return 0;}\n#endif\n#endif\n")
+        tus = onboard.header_only_sources(root, ["."])
+        self.assertEqual(len(tus), 1)
+        body = util.read_text(os.path.join(root, tus[0]))
+        self.assertIn("#define TINY_IMPLEMENTATION", body)
+        self.assertTrue(onboard.analysis_file(root, tus[0]).endswith("tiny.h"))
+
+    def test_mixed_cxx_build_is_shell_command(self):
+        from kavachforge import toolchain
+        tc = toolchain.Toolchain("standalone", "clang", "t", "")
+        cmd = toolchain.build_fuzzer_cmd(tc, ["/r/a.c"], "/r/h.cc", ["/r/inc"], "/o/fz", ["-lm"])
+        self.assertIsInstance(cmd, str)
+        self.assertIn("clang++", cmd); self.assertIn("-c /r/a.c", cmd); self.assertIn("-lm", cmd)
+        self.assertIn("kv_standalone_main.c", cmd)
+        pure = toolchain.build_fuzzer_cmd(tc, ["/r/a.c"], "/r/h.c", ["/r/inc"], "/o/fz")
+        self.assertIsInstance(pure, list)
+        self.assertEqual(toolchain.cxx_for("/usr/lib/llvm-18/bin/clang"), "/usr/lib/llvm-18/bin/clang++")
+
+    def test_entry_ranking_prefers_public_parser(self):
+        from kavachforge import harness
+        root = self._repo()
+        ents = harness.analyze(os.path.join(root, "src", "lib.c"))
+        self.assertEqual([e.name for e in ents], ["lib_parse"])     # static helper never an entry
+        self.assertEqual(ents[0].shape, "cstr_size")
+        self.assertEqual(harness._classify("const char *filename"), ("cstr", 50))
+        self.assertEqual(harness._classify("ctx *c, const char *s, size_t n")[0], "other")
+        self.assertEqual(harness._classify("const char *js, const size_t len, tok *t"), ("cstr_size", 80))
+
+    def test_error_return_matches_signature(self):
+        from kavachforge import patcher
+        self.assertEqual(patcher._pick_error_return("", "{ x; }", "char *process(const char *in)"), "return NULL;")
+        self.assertEqual(patcher._pick_error_return("", "{ x; }", "void f(int a)"), "return;")
+        self.assertEqual(patcher._pick_error_return("", "{ ...\nerror:\n  free(p);\n}", "int f(void)"), "goto error;")
+        self.assertEqual(patcher._pick_error_return("", "{ x; }", "size_t f(void)"), "return 0;")
+        self.assertEqual(patcher._pick_error_return("", "{ x; }", "int f(void)"), "return -1;")
+
+    def test_allocation_enlarge_strategy(self):
+        """A heap WRITE one past a buffer the function allocates is repaired at
+        the allocation (the classic missing '+ 1'), not by guarding the write."""
+        from kavachforge import patcher
+        root = tempfile.mkdtemp(prefix="kv_alloc_")
+        src = os.path.join(root, "p.c")
+        util.write_text(src, "#include <stdlib.h>\n#include <string.h>\n"
+                             "char *dup(const char *in, size_t n) {\n"
+                             "    char *out = (char*)malloc(n * sizeof(char));\n"
+                             "    if (!out) return NULL;\n"
+                             "    memcpy(out, in, n);\n"
+                             "    out[n] = '\\0';\n"
+                             "    return out;\n}\n")
+        task = config.Task(name="t", language="c", root=root, sources=[src], harness="",
+                           include_dirs=[root], test_sources=[], patch_scope=[src], magic=None,
+                           diff_changed=[], static_alerts=[], description="", seeds=[])
+        f = verifier.Finding(id="KV-T-001", signature="s", asan_class="heap-buffer-overflow",
+                             cwe="CWE-787", cwe_name="", severity="Critical", access="Write 1B",
+                             crash_file="p.c:7", crash_func="dup")
+        vs = patcher.synth_variants(task, f)
+        labels = [v.label for v in vs]
+        self.assertIn("allocate room for terminator", labels)
+        v = next(v for v in vs if v.label == "allocate room for terminator")
+        self.assertIn("malloc((n * sizeof(char)) + 1)", v.diff)
+        self.assertIsNone(patcher.check_policy(task, v.diff))

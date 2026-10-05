@@ -150,29 +150,98 @@ def detect(prefer: Optional[str] = None) -> Toolchain:
         "gcc+libasan, or run KavachForge via Docker (./kavach ... --docker).")
 
 
-def build_fuzzer_cmd(tc: Toolchain, sources: List[str], harness: str,
-                     include_dirs: List[str], out_bin: str,
-                     link_flags: Optional[List[str]] = None) -> List[str]:
-    """Command that produces the discovery binary `out_bin`."""
-    inc = []
+CXX_EXT = (".cc", ".cpp", ".cxx", ".C")
+
+
+def is_cxx(path: str) -> bool:
+    return path.endswith(CXX_EXT)
+
+
+def cxx_for(cc: str) -> str:
+    """The C++ front-end that pairs with the C compiler `cc`."""
+    base = os.path.basename(cc)
+    name = {"clang": "clang++", "gcc": "g++", "cc": "c++"}.get(base)
+    if name is None:
+        # clang-18 -> clang++-18, /opt/llvm/bin/clang -> /opt/llvm/bin/clang++
+        name = base.replace("clang", "clang++", 1) if "clang" in base else \
+               base.replace("gcc", "g++", 1) if "gcc" in base else base + "++"
+    d = os.path.dirname(cc)
+    return os.path.join(d, name) if d else name
+
+
+def _compiler_for(tc: Toolchain, files: List[str]) -> List[str]:
+    """Pick the C or C++ driver for `tc.cc` based on the files being built
+    (single-language builds). Mixed C/C++ builds go through `_mixed_cmd`."""
+    if not any(is_cxx(f) for f in files):
+        return [tc.cc]
+    return [cxx_for(tc.cc), "-std=c++17"]
+
+
+def _q(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+def _mixed_cmd(tc: Toolchain, files: List[str], flags: List[str], out_bin: str,
+               link_flags: List[str]) -> str:
+    """Shell command for a build that mixes C and C++ translation units
+    (common in real repos: a C library with a C++ fuzz harness). Each file is
+    compiled by its own front-end into <out_bin>.objs/, then linked with the
+    C++ driver so the C++ runtime is pulled in."""
+    objdir = out_bin + ".objs"
+    cxx = cxx_for(tc.cc)
+    steps = ["mkdir -p %s" % _q(objdir)]
+    objs = []
+    for i, f in enumerate(files):
+        o = os.path.join(objdir, "%03d_%s.o" % (i, os.path.basename(f)))
+        objs.append(o)
+        comp = [cxx, "-std=c++17"] if is_cxx(f) else [tc.cc]
+        steps.append(" ".join(_q(x) for x in comp + flags + ["-c", f, "-o", o]))
+    lflags, skip = [], False
+    for x in flags:                      # drop "-I dir" pairs for the link step
+        if skip:
+            skip = False; continue
+        if x == "-I":
+            skip = True; continue
+        lflags.append(x)
+    link = [cxx] + lflags + objs + ["-o", out_bin] + link_flags
+    steps.append(" ".join(_q(x) for x in link))
+    return " && ".join(steps)
+
+
+def _build(tc: Toolchain, files: List[str], san: List[str], include_dirs: List[str],
+           out_bin: str, link_flags: Optional[List[str]]):
+    inc: List[str] = []
     for d in include_dirs:
         inc += ["-I", d]
+    flags = BASE_FLAGS + san + inc
+    lf = list(link_flags or [])
+    if len({is_cxx(f) for f in files}) > 1:
+        return _mixed_cmd(tc, files, flags, out_bin, lf)
+    comp = _compiler_for(tc, files)
+    return comp + flags + files + ["-o", out_bin] + lf
+
+
+def cmd_str(cmd) -> str:
+    return cmd if isinstance(cmd, str) else " ".join(cmd)
+
+
+def build_fuzzer_cmd(tc: Toolchain, sources: List[str], harness: str,
+                     include_dirs: List[str], out_bin: str,
+                     link_flags: Optional[List[str]] = None):
+    """Command that produces the discovery binary `out_bin` (a list, or a
+    shell string for mixed C/C++ builds; util.run accepts both)."""
     if tc.is_libfuzzer:
         san = ["-fsanitize=fuzzer,address"]
         extra_src: List[str] = []
     else:
         san = ["-fsanitize=address"] + ([tc.cov_flag] if tc.cov_flag else [])
         extra_src = [STANDALONE_MAIN]
-    return [tc.cc] + BASE_FLAGS + san + inc + sources + [harness] + extra_src + \
-           ["-o", out_bin] + list(link_flags or [])
+    return _build(tc, sources + [harness] + extra_src, san, include_dirs, out_bin, link_flags)
 
 
 def build_test_cmd(tc: Toolchain, test_sources: List[str],
                    include_dirs: List[str], out_bin: str,
-                   link_flags: Optional[List[str]] = None) -> List[str]:
+                   link_flags: Optional[List[str]] = None):
     """Command that builds the regression-test binary (ASan only, no fuzzer)."""
-    inc = []
-    for d in include_dirs:
-        inc += ["-I", d]
-    return [tc.cc] + BASE_FLAGS + ["-fsanitize=address"] + inc + test_sources + \
-           ["-o", out_bin] + list(link_flags or [])
+    return _build(tc, test_sources, ["-fsanitize=address"], include_dirs, out_bin, link_flags)

@@ -154,6 +154,32 @@ Provider-agnostic, `urllib` only. Budget default: 6 calls/target (`--budget`).
 
 ## Point it at your own target
 
+### Bring your own repository — one command
+
+The finale hands teams unfamiliar open-source repositories. `kavach onboard` turns any C/C++ repo into a task with no hand-written config:
+
+```bash
+./kavach onboard https://github.com/DaveGamble/cJSON --run          # clone, scan, build-fix, run
+./kavach onboard ./some/checkout --provider anthropic --run         # a model wires non-trivial APIs
+./kavach onboard <url> --ref v1.7.7 --harness read --time 120       # tag, harness choice, budget
+```
+
+What it does, in order — every decision is printed, nothing is guessed silently:
+
+| step | what happens |
+|---|---|
+| fetch | shallow clone into `targets/_onboarded/<name>` (git-ignored), or use a local path in place |
+| scan | library sources vs. tests/examples/tools/benchmarks; header dirs; every shipped `LLVMFuzzerTestOneInput` |
+| compile pass | each file must compile here; files that export `main` (checked with `nm`, so an `#ifdef`'d test main does not count) are dropped |
+| build-fix | link the harness and repair iteratively: duplicate symbol → drop the re-definer; undefined reference → add `-lm/-lpthread/-ldl/-lz` or re-add a skipped helper that defines it; missing generated headers → try `cmake`/`./configure` |
+| harness | if the repo ships none: rank public parser-shaped entry points (static and internal helpers never qualify), template a harness for buffer-first signatures, or hand a member function / context-first API to the model (C or C++, `extern "C"` added) |
+| sanity | the discovery binary must run cleanly on `""`, `"x"`, `"{}"` … — a harness that faults on trivial input is flagged **SUSPICIOUS** before any finding is trusted |
+| emit | `tasks/<name>.json` (one per harness), seeds from any `corpus/`/`seeds/` dir, `diff: git` wired for risk ranking; header-only libraries get a generated translation unit and the header as patch scope |
+
+Validated on repos the project had never seen: **parson, sds, jsmn (header-only), cJSON (shipped harness, straight from GitHub), tinyxml2 (C++, model-written harness)** — and honestly refused on **libpng** offline (callback-based API; needs a model). A planted off-by-one in parson was found in 0.1 s, classified CWE-787, repaired at the allocation (root cause) and proven through all six gates with no hand-written configuration.
+
+### Or write the task by hand
+
 Drop a JSON task in `tasks/` (paths relative to `root`). Existing OSS-Fuzz-style harnesses (`LLVMFuzzerTestOneInput`) work unchanged.
 
 ```json

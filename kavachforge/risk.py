@@ -73,7 +73,8 @@ def analyze(task: "config.Task", harness_text: str) -> List[Dict]:
     entry_calls = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", harness_text))
 
     ranked: List[FuncRisk] = []
-    for src_path in task.sources:
+    scan_files = list(task.sources) + [p for p in task.patch_scope if p not in task.sources]
+    for src_path in scan_files:
         rel = config.rel_to_root(task, src_path)
         src = util.read_text(src_path)
         for name, start, line in _functions(src):

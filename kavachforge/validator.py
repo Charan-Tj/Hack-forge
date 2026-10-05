@@ -61,7 +61,8 @@ def _remap(task: "config.Task", worktree: str, abspath: str) -> str:
 def _build_tests(task, tc, worktree, out_bin) -> "util.CmdResult":
     srcs = [_remap(task, worktree, s) for s in task.test_sources]
     incs = [_remap(task, worktree, i) for i in task.include_dirs]
-    return util.run(toolchain.build_test_cmd(tc, srcs, incs, out_bin), timeout=120)
+    return util.run(toolchain.build_test_cmd(tc, srcs, incs, out_bin,
+                                             link_flags=task.link_flags), timeout=120)
 
 
 def baseline_tests(task: "config.Task", tc: "toolchain.Toolchain",

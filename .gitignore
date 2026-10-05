@@ -4,3 +4,5 @@ cache/llm/
 *.pyc
 *.o
 *.out
+targets/_onboarded/
+.kavach/

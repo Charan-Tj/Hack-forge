@@ -4,6 +4,7 @@
     kavach run <task>         full closed loop on one task
     kavach replay [task]      deterministic offline run (no network, no key)
     kavach demo               run all bundled targets
+    kavach onboard <repo>     bring your own repo: clone, scan, build-fix, emit a task
     kavach doctor             check the toolchain / environment
     kavach selftest           run the built-in unit tests
     kavach serve              serve existing dashboards over HTTP
@@ -186,6 +187,22 @@ def _cmd_list(args) -> int:
     for n in TASKS:
         t = config.load_task(n)
         util.info("%-12s %s" % (n, t.description))
+    import glob
+    import json
+    extra = []
+    for p in sorted(glob.glob(os.path.join(config.PROJECT_ROOT, "tasks", "*.json"))):
+        n = os.path.splitext(os.path.basename(p))[0]
+        if n in TASKS:
+            continue
+        try:
+            d = json.load(open(p))
+        except Exception:
+            continue
+        extra.append((n, d.get("description", ""), bool(d.get("_onboarded") or d.get("_synthesized"))))
+    if extra:
+        util.stage("Other tasks (onboarded / synthesized / vendored)")
+        for n, desc, gen in extra:
+            util.info("%-12s %s%s" % (n, desc, "  [generated]" if gen else ""))
     return 0
 
 
@@ -315,6 +332,44 @@ def _cmd_harness(args) -> int:
     return 0 if syn.validated else 2
 
 
+def _cmd_onboard(args) -> int:
+    from . import llm, onboard
+    client = None
+    if args.provider and args.provider != "none":
+        client = llm.LLMClient(provider=args.provider, budget=args.budget)
+    util.stage("Onboarding — %s" % args.repo)
+    try:
+        ob = onboard.onboard(args.repo, name=args.name, harness_sel=args.harness,
+                             budget_s=args.time, client=client, ref=args.ref, log=util.step)
+    except Exception as e:
+        util.bad(str(e)); return 1
+    util.info("root     : %s" % ob.root)
+    if ob.harnesses:
+        util.info("harness  : %s%s" % (", ".join(ob.harnesses),
+                                       "  (synthesized)" if ob.synthesized else "  (shipped by the repo)"))
+    util.info("includes : %s" % ", ".join(ob.include_dirs[:8]) + (" ..." if len(ob.include_dirs) > 8 else ""))
+    util.info("sources  : %d kept" % len(ob.sources))
+    for f, why in ob.dropped[:12]:
+        util.step(util.dim("dropped %s — %s" % (f, why)))
+    if len(ob.dropped) > 12:
+        util.step(util.dim("... %d more dropped" % (len(ob.dropped) - 12)))
+    if ob.link_flags:
+        util.info("link     : %s" % " ".join(ob.link_flags))
+    for n in ob.log:
+        util.step(n)
+    if not ob.built:
+        util.bad(ob.detail); return 2
+    util.good(ob.detail)
+    for t in ob.tasks:
+        util.good("task     : %s" % os.path.relpath(t))
+    names = [os.path.splitext(os.path.basename(t))[0] for t in ob.tasks]
+    util.info("run it:  ./kavach run %s" % names[0])
+    if args.run:
+        return _run_many(names if args.all_harnesses else names[:1], args,
+                         provider=(None if args.provider in (None, "none") else args.provider))
+    return 0
+
+
 def _cmd_ci(args) -> int:
     from . import ci
     if args.provider:
@@ -397,6 +452,26 @@ def main(argv=None) -> int:
     sp.add_argument("--diff", default=None)
     sp.add_argument("--sarif", default=None)
     sp.set_defaults(func=_cmd_harness)
+
+    sp = sub.add_parser("onboard", help="bring your own repo: clone/scan/build-fix an "
+                        "arbitrary C/C++ project into a task (one command)")
+    sp.add_argument("repo", help="git URL or local directory")
+    sp.add_argument("--name", default=None, help="task/target name (default: repo name)")
+    sp.add_argument("--harness", default=None, help="substring selecting one shipped harness")
+    sp.add_argument("--ref", default=None, help="branch or tag to clone (URL repos)")
+    sp.add_argument("--time", type=int, default=60, help="fuzzing time budget (s) for the task")
+    sp.add_argument("--run", action="store_true", help="run the loop right after onboarding")
+    sp.add_argument("--all-harnesses", action="store_true",
+                    help="with --run: run every onboarded harness, not just the first")
+    sp.add_argument("--provider", default=None, help="model for harness synthesis / repair")
+    sp.add_argument("--model", default=None)
+    sp.add_argument("--budget", type=int, default=6)
+    sp.add_argument("--engine", choices=["libfuzzer", "standalone"], default=None)
+    sp.add_argument("--keep", action="store_true")
+    sp.add_argument("--uplift", action="store_true")
+    sp.add_argument("--diff", default=None)
+    sp.add_argument("--sarif", default=None)
+    sp.set_defaults(func=_cmd_onboard)
 
     sp = sub.add_parser("ci", help="pull-request check: run on changed targets, "
                         "write a summary, emit fix patches, set exit code")

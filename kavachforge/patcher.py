@@ -83,7 +83,8 @@ def check_policy(task: "config.Task", diff: str) -> Optional[str]:
 
     # Must add a guard (comparison or clamp), not merely remove the sink.
     has_guard = bool(re.search(r"\bif\s*\(.*[<>]=?.*\)", added_text)) or \
-        bool(re.search(r"=\s*\w+\s*>\s*\w+\s*\?", added_text))
+        bool(re.search(r"=\s*\w+\s*>\s*\w+\s*\?", added_text)) or \
+        bool(re.search(r"alloc\s*\(.*\+\s*1\b", added_text))   # allocation enlarged
     if removed and not added:
         return "patch only removes code; a guard/validation must be added"
     if not has_guard:
@@ -125,10 +126,29 @@ def _function_bounds(text: str, line_no: int) -> Tuple[int, int]:
     return 0, len(text)
 
 
-def _pick_error_return(text: str) -> str:
-    m = re.search(r"return\s+(\w*ERR\w*)\s*;", text)
-    if m:
-        return "return %s;" % m.group(1)
+def _pick_error_return(text: str, body: str = "", header: str = "") -> str:
+    """The statement a guard uses to bail out. Prefer what the function itself
+    already does on error (a cleanup label, an error enum it returns), then
+    fall back on the return type: pointer -> NULL, void -> bare return,
+    bool -> false, anything else -> -1. Wrong-typed bail-outs are what make a
+    heuristic patch fail to rebuild on unfamiliar code."""
+    lm = re.search(r"^\s*(error|err|fail|failure|cleanup|out|bail|done)\s*:\s*$", body, re.M)
+    if lm:
+        return "goto %s;" % lm.group(1)
+    for scope in (body, text):
+        m = re.search(r"return\s+(\w*(?:ERR|FAIL|INVALID|ERROR)\w*)\s*;", scope)
+        if m:
+            return "return %s;" % m.group(1)
+    sig = re.search(r"([A-Za-z_][\w\s\*\(\)]*?)\b[A-Za-z_]\w*\s*\([^;{}]*\)\s*$", header.strip())
+    rtype = (sig.group(1) if sig else "").strip()
+    if "*" in rtype:
+        return "return NULL;"
+    if re.search(r"\bvoid\s*$", rtype):
+        return "return;"
+    if re.search(r"\b(bool|_Bool)\b", rtype):
+        return "return false;"
+    if re.search(r"\bsize_t\b|\bunsigned\b|\buint\d+_t\b", rtype):
+        return "return 0;"
     return "return -1;"
 
 
@@ -156,7 +176,8 @@ def synth_variants(task: "config.Task", finding: "verifier.Finding") -> List[Pat
         line_no = 1
     fstart, fend = _function_bounds(text, line_no)
     body = text[fstart:fend]
-    err_ret = _pick_error_return(text)
+    header = text[max(0, text.rfind("\n", 0, text.rfind("\n", 0, fstart))):fstart]
+    err_ret = _pick_error_return(text, body, header)
     lines = text.splitlines(keepends=True)
     lo = text[:fstart].count("\n")
     hi = text[:fend].count("\n")
@@ -194,6 +215,36 @@ def synth_variants(task: "config.Task", finding: "verifier.Finding") -> List[Pat
                                         "immediately before the out-of-bounds read."))
                 return out
 
+    # ---- Strategy D: heap WRITE one past a buffer this function allocated --
+    # (the classic missing "+ 1" for a terminator). Enlarge the allocation at
+    # its root cause rather than guarding the write.
+    if (finding.access or "").lower().startswith("write") and 0 < line_no <= len(lines) \
+            and "heap" in (finding.asan_class or ""):
+        crash_line = lines[line_no - 1]
+        wm = re.search(r"^\s*\*?\s*([A-Za-z_]\w*)(?:\s*\[[^\]]*\]|\s*\+\+)?\s*=[^=]", crash_line)
+        for i in range(lo, min(hi + 1, len(lines))):
+            am = re.search(r"\b(\w*alloc)\s*\((.+)\)\s*;", lines[i])
+            if not am or re.search(r"\+\s*1\b", am.group(2)):
+                continue
+            # the allocated pointer must be what the crash line writes through
+            lhs = re.match(r"\s*(?:\w+\s*=\s*)?(?:\([^)]*\)\s*)?", lines[i])
+            target = re.search(r"\b([A-Za-z_]\w*)\s*=\s*(?:\([^)]*\)\s*)?\w*alloc\s*\(", lines[i])
+            tname = target.group(1) if target else ""
+            if wm and tname and tname != wm.group(1) and not re.search(r"\b%s\b" % re.escape(tname), body[body.find(wm.group(1)):][:200] if wm.group(1) in body else ""):
+                # the write goes through a different pointer; accept only if it
+                # was derived from this allocation (ptr = buf;)
+                if not re.search(r"\b%s\s*=\s*%s\s*;" % (re.escape(wm.group(1)), re.escape(tname)), body):
+                    continue
+            new_line = lines[i].replace(am.group(0), "%s((%s) + 1);" % (am.group(1), am.group(2).strip()), 1)
+            patched = lines[:i] + [new_line] + lines[i + 1:]
+            diff = "".join(difflib.unified_diff(lines, patched, fromfile="a/" + rel, tofile="b/" + rel, n=3))
+            out.append(PatchResult(diff=diff, rel_path=rel, source="offline-heuristic", attempts=1,
+                                   rationale="The function writes one element past the buffer it allocates "
+                                             "(a terminator or sentinel); size the allocation for it.",
+                                   rejected=[], label="allocate room for terminator", strategy="root-cause",
+                                   guard_line=i + 1, root_cause_line=i + 1, distance=0, added_lines=1))
+            break
+
     # ---- Strategy B: unchecked memcpy length ------------------------------
     mm = re.search(r"memcpy\s*\(\s*([^,]+),\s*[^,]+,\s*([^)]+)\)", body)
     if mm:
@@ -202,13 +253,18 @@ def synth_variants(task: "config.Task", finding: "verifier.Finding") -> List[Pat
         # capacity = a DECLARATION "field[CAP]" where CAP is a macro or integer
         # literal (never a lowercase index variable such as the length itself).
         fm = re.search(r"\b%s\s*\[\s*([A-Z_][A-Z0-9_]*|\d+)\s*\]" % re.escape(field), text)
-        capname = fm.group(1) if fm else (_macro_value_name(text, []) or "sizeof(%s)" % dst)
+        capname = fm.group(1) if fm else None
+        if capname is None and re.search(r"\b%s\s*\[" % re.escape(field), text):
+            capname = "sizeof(%s)" % dst
+    if mm and capname is None:
+        mm = None            # no fixed-capacity destination: guessing a macro would be noise
+    if mm:
         # if the buffer is also written at [length] (a null terminator), the
         # safe bound is >= capacity, not > capacity.
         term = bool(re.search(r"\b%s\s*\[\s*%s\s*\]\s*=" % (re.escape(field), re.escape(length)), body))
         op = ">=" if term else ">"
         free_m = re.search(r"free\s*\(\s*(\w+)\s*\)", body)
-        cleanup = ("free(%s); " % free_m.group(1)) if free_m else ""
+        cleanup = ("free(%s); " % free_m.group(1)) if (free_m and not err_ret.startswith("goto")) else ""
         use_i = next((i for i in range(lo, min(hi + 1, len(lines))) if "memcpy(" in lines[i]), None)
         root = _first_assignment_line(lines, lo, hi, length)
         if use_i is not None:
@@ -231,7 +287,10 @@ def synth_variants(task: "config.Task", finding: "verifier.Finding") -> List[Pat
         count = lm.group(1)
         dm = (re.search(r"\[\s*([A-Z_][A-Z0-9_]*)\s*\]", body)
               or re.search(r"\[\s*(\d+)\s*\]", body))
-        capname = dm.group(1) if dm else (_macro_value_name(text, []) or "16")
+        capname = dm.group(1) if dm else None
+    if lm and capname is None:
+        lm = None
+    if lm:
         loop_i = next((i for i in range(lo, min(hi + 1, len(lines)))
                        if re.search(r"for\s*\(.*<\s*%s\s*;" % re.escape(count), lines[i])), None)
         root = _first_assignment_line(lines, lo, hi, count)

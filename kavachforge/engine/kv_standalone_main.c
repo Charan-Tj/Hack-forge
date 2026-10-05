@@ -23,8 +23,17 @@
 #include <stdint.h>
 #include <string.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 __attribute__((weak)) int LLVMFuzzerInitialize(int *argc, char ***argv);
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop);
+void __sanitizer_cov_trace_pc_guard(uint32_t *guard);
+void __sanitizer_cov_trace_pc(void);
+#ifdef __cplusplus
+}
+#endif
 
 #define KV_MAP_SIZE (1u << 16)
 static uint8_t kv_cov_map[KV_MAP_SIZE];

@@ -73,8 +73,10 @@ def _trim_report(blob: str, max_lines: int = 40) -> str:
 
 
 def _signature(asan_class: str, frames: List[Dict]) -> str:
-    """Normalized, address-free signature: class + top in-target frames."""
-    top = [f for f in frames if f["in_target"]][:3] or frames[:3]
+    """Normalized, address-free signature: class + the in-target crash site
+    (one bug reached through two callers is still one bug - the repair is
+    the same line either way); without an in-target frame, top 3 frames."""
+    top = [f for f in frames if f["in_target"]][:1] or frames[:3]
     key = asan_class + "|" + "|".join("%s@%s:%d" % (f["func"], f["file"], f["line"])
                                       for f in top)
     return util.sha256_bytes(key.encode())[:16]
@@ -82,7 +84,7 @@ def _signature(asan_class: str, frames: List[Dict]) -> str:
 
 def verify(task: "config.Task", fuzzer_bin: str,
            raw_crashes: List[Dict]) -> List[Finding]:
-    source_basenames = {os.path.basename(s) for s in task.sources}
+    source_basenames = {os.path.basename(s) for s in list(task.sources) + list(task.patch_scope)}
     seen: Dict[str, Finding] = {}
     findings: List[Finding] = []
 

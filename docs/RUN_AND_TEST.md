@@ -85,13 +85,14 @@ If it prints `ISSUES FOUND`, the line above it says exactly what is missing.
 | `./kavach showcase [task] [--fresh] [--port N]` | Starts the live dashboard **first**, then runs every bundled target (or one). Index + per-target dashboards update after each stage. Stays serving until Ctrl-C. |
 | `./kavach watch <task>` | **Live self-healing mode.** Makes the target a git baseline, runs it once, then re-runs the full loop every time a file under the target is saved (risk ranking driven by the live `git diff`). |
 | `./kavach reset <task>` | Restores a watched target to its baseline (`git checkout` + clean). |
+| `./kavach onboard <url-or-dir> [--run]` | **Bring your own repo.** Clone, scan, build-fix, find or write a harness, emit a task (§7a). |
 | `./kavach run <task>` | Full loop on one target, no server. |
 | `./kavach demo` | All three targets, no server. |
 | `./kavach replay [task]` | Deterministic offline run: forces the heuristic brain, no network, no key. Same numbers every time. |
 | `./kavach serve [--port N]` | Serve existing `artifacts/` dashboards only. |
 | `./kavach doctor` | Environment check. |
-| `./kavach selftest [-v]` | 27 unit tests (stdlib `unittest`). |
-| `./kavach list` | List bundled targets. |
+| `./kavach selftest [-v]` | 43 unit tests (stdlib `unittest`). |
+| `./kavach list` | List bundled targets, plus onboarded/synthesized ones. |
 | `./kavach clean` | Delete `artifacts/`. |
 
 ### Useful flags (run / demo / showcase / watch)
@@ -247,6 +248,42 @@ cleanjson    raw=0  unique=0 verified=0 first_pov=n/a
 ---
 
 ## 7. Bring your own target
+
+### 7a. The one-command way (what you will do at the finale)
+
+```bash
+./kavach onboard https://github.com/<org>/<repo>            # or a local directory
+./kavach onboard https://github.com/<org>/<repo> --run      # ...and run the loop
+./kavach onboard <repo> --provider anthropic --run          # model writes the harness when
+                                                            # the API is not a plain parse(buf,len)
+```
+
+Options: `--name` (task name), `--ref` (branch/tag), `--harness <substring>` (pick one of
+several shipped harnesses), `--time <s>` (fuzzing budget), `--all-harnesses` (with `--run`).
+
+Read the output top to bottom — it is the audit trail:
+
+```
+→ scan: 2 library source(s), 1 harness(es), 12 header dir(s), 73 skipped
+→ build-fix: harness fuzzing/cjson_read_fuzzer.c
+→   links with 2 source file(s)
+  harness  : fuzzing/cjson_read_fuzzer.c  (shipped by the repo)
+  sources  : 2 kept
+  → dropped xmltest.cpp — defines main() - a program, not library code
+  → harness ...: sanity OK (clean on trivial inputs)
+✔ 1 task(s) written; 2 source file(s) kept, 0 dropped
+✔ task     : tasks/cjson-oss.json
+```
+
+Exit codes: 0 onboarded, 2 could not build a harness (the last line says why — usually
+"no fuzzable entry point" for callback-style APIs, which `--provider` fixes), 1 bad input.
+
+Tested on real repos (all offline unless noted): parson ✔, sds ✔, jsmn (header-only) ✔ with
+a model, cJSON ✔ (its own `fuzzing/` harness), tinyxml2 (C++) ✔ with a model, libpng ✖
+offline (honest refusal: no byte-buffer entry point). Clones live in
+`targets/_onboarded/` (git-ignored); a generated harness lives in `<repo>/.kavach/`.
+
+### 7b. By hand
 
 Any libFuzzer / OSS-Fuzz-style harness (`LLVMFuzzerTestOneInput`) works. Add
 `tasks/<name>.json`:

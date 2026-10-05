@@ -1,0 +1,37 @@
+{
+  "name": "urlparse",
+  "language": "c",
+  "description": "Auto-harnessed: urlparse() [synthesized entry point]",
+  "root": "targets/urlparse",
+  "sources": [
+    "src/urlparse.c"
+  ],
+  "include_dirs": [
+    "src"
+  ],
+  "harness": "harness/fuzz_urlparse.c",
+  "probe": "harness/probe_urlparse.c",
+  "test_sources": [
+    "src/urlparse.c",
+    "tests/test_urlparse.c"
+  ],
+  "patch_scope": [
+    "src/urlparse.c"
+  ],
+  "diff_changed": [
+    "src/urlparse.c"
+  ],
+  "static_alerts": [],
+  "budgets": {
+    "time_budget_s": 30,
+    "rng_seed": 1337
+  },
+  "_synthesized": {
+    "entry": "urlparse",
+    "shape": "buf_size",
+    "validated": true
+  },
+  "seeds": [
+    "seeds/long_host.url"
+  ]
+}

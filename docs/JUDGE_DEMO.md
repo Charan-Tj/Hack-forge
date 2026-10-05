@@ -165,5 +165,15 @@ execs with 0 findings; 27/27 unit tests.
 **Patch ensemble + behaviour gate (point at any finding card).**
 "It doesn't write one patch — it writes several (validate-at-read, guard-at-use, clamp), runs all of them through every gate, and picks the one closest to the root cause. Gate G5 replays hundreds of valid inputs through a behaviour probe; a patch that silently changes any of them is rejected. Published research found 40% of patches that pass 'PoC + tests' are still wrong — G5 is exactly that check."
 
+**Bring-your-own-repo (the finale format) (~2 minutes).**
+Ask the judges for any C/C++ GitHub URL — or use one you have cloned. Run
+`./kavach onboard <url> --run` (add `--provider anthropic` if a key is set). Narrate the
+scan/build-fix lines as they appear: "It found the library files, dropped the test program
+because the object exports main, found the repo's own fuzzer — or wrote one — and checked
+that the harness does not fault on trivial input before trusting any finding." Then the
+normal loop runs. Rehearsed offline on parson, sds, cJSON; with a model on jsmn and tinyxml2.
+If a repo cannot be onboarded, the last line says exactly why — read it out loud; honesty
+about a callback-style API is worth more than a fake success.
+
 **CI integration (if you have network + the repo open).**
 Open a PR that deletes a bounds check → the KavachForge Action comments a summary table, fails the check, and opens a `kavachforge/fix-*` PR with the fix + regression test. Say: "This is the whole loop wired into a real pull-request workflow."
