@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 from . import config, util
 from .pipeline import run_task
 
-TASKS = ["tinyimg", "recordcfg", "cleanjson"]
+TASKS = ["tinyimg", "recordcfg", "sigpkt", "cleanjson"]
 
 
 def _changed_paths(base: str) -> List[str]:

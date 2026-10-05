@@ -118,7 +118,11 @@ def _cmd_doctor(args) -> int:
 
 
 def _cmd_replay(args) -> int:
+    # Fully deterministic demo: offline brain + the standalone engine (fixed
+    # RNG / seed-driven). libFuzzer is intentionally randomized, so forcing the
+    # standalone engine is what makes replay byte-identical every run.
     os.environ["KAVACH_LLM_PROVIDER"] = "offline"
+    args.engine = "standalone"
     names = TASKS if args.task in (None, "all") else [args.task]
     return _run_many(names, args, provider="offline")
 

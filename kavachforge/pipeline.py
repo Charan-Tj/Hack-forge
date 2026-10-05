@@ -103,11 +103,24 @@ def _finding_dict(f: "verifier.Finding", work_dir: str, pr, validation) -> Dict:
 
 
 def _write_manifest(work_dir: str) -> str:
-    """Tamper-evident listing: sha256 of every artifact in the bundle."""
+    """Tamper-evident listing: sha256 of every immutable evidence artifact
+    (PoV inputs, crashes, corpus, patches, regression tests, prompt log).
+
+    The generated *views* (evidence.json, dashboard.html) and the run log are
+    excluded: they are rewritten after the manifest is computed (the dashboard
+    displays the bundle hash, which would otherwise be a cycle), so hashing
+    them would always mismatch. The manifest attests the evidence, not the
+    report rendered from it."""
+    EXCLUDE = {"manifest.json", "evidence.json", "dashboard.html", "run.log",
+               "_candidate", "index.html", ".showcase.json"}
     entries = []
     for dp, _, files in os.walk(work_dir):
+        # skip transient fuzzing/diff scratch dirs
+        rel_dir = os.path.relpath(dp, work_dir)
+        if rel_dir.split(os.sep)[0] in ("diffcorpus", "uplift", "gen"):
+            continue
         for name in sorted(files):
-            if name in ("manifest.json", "_candidate"):
+            if name in EXCLUDE:
                 continue
             p = os.path.join(dp, name)
             if os.path.islink(p):
@@ -118,7 +131,10 @@ def _write_manifest(work_dir: str) -> str:
                                 "bytes": os.path.getsize(p)})
             except OSError:
                 pass
+    entries.sort(key=lambda e: e["path"])
     man = {"generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+           "attests": "immutable evidence inputs (PoV, crashes, corpus, patches, "
+                      "regression tests, prompt log); excludes generated views and logs",
            "files": entries}
     man["bundle_sha256"] = util.sha256_bytes(
         "\n".join(e["path"] + ":" + e["sha256"] for e in entries).encode())

@@ -301,3 +301,28 @@ class TestNewFeatures(unittest.TestCase):
         self.assertTrue(any(s[:4] == b"SPK1" for s in seeds))
         # a generated seed must satisfy the parser's digest gate (first 9 bytes header)
         self.assertTrue(any(len(s) >= 9 for s in seeds))
+
+
+class TestManifest(unittest.TestCase):
+    def test_excludes_views_and_hashes_match(self):
+        import hashlib
+        from kavachforge import pipeline
+        d = tempfile.mkdtemp()
+        # immutable evidence + mutable views
+        util.write_text(os.path.join(d, "crashes", "crash-abc"), "pov")
+        util.write_text(os.path.join(d, "pr", "KV-1", "fix.patch"), "diff")
+        util.write_text(os.path.join(d, "evidence.json"), '{"a":1}')
+        util.write_text(os.path.join(d, "dashboard.html"), "<html>")
+        util.write_text(os.path.join(d, "run.log"), "log")
+        pipeline._write_manifest(d)
+        import json
+        man = json.load(open(os.path.join(d, "manifest.json")))
+        paths = {e["path"] for e in man["files"]}
+        self.assertIn(os.path.join("crashes", "crash-abc"), paths)
+        self.assertIn(os.path.join("pr", "KV-1", "fix.patch"), paths)
+        for excluded in ("evidence.json", "dashboard.html", "run.log", "manifest.json"):
+            self.assertNotIn(excluded, paths)
+        # every listed hash matches the file on disk
+        for e in man["files"]:
+            h = hashlib.sha256(open(os.path.join(d, e["path"]), "rb").read()).hexdigest()
+            self.assertEqual(h, e["sha256"])
