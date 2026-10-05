@@ -40,6 +40,12 @@ class PatchResult:
     attempts: int
     rationale: str
     rejected: List[str]      # reasons for rejected attempts
+    label: str = "patch"     # short strategy name for the ensemble table
+    strategy: str = ""       # "use-site" | "root-cause" | "clamp" | "llm"
+    guard_line: int = 0      # 1-based line in the patched file where the guard sits
+    root_cause_line: int = 0 # where the untrusted value is first assigned
+    distance: int = 0        # |guard_line - root_cause_line|
+    added_lines: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -134,10 +140,14 @@ def _macro_value_name(text: str, hint_tokens) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def synth_patch(task: "config.Task", finding: "verifier.Finding") -> Optional[PatchResult]:
+def synth_variants(task: "config.Task", finding: "verifier.Finding") -> List[PatchResult]:
+    """Deterministic repair brain: emit several candidate patches for the
+    ensemble. Each candidate is a one-line guard; they differ in WHERE the
+    guard sits (use site vs. where the untrusted value is first assigned) and
+    in semantics (reject vs. clamp). The validator + ranker decide."""
     path = _find_source(task, finding)
     if not path:
-        return None
+        return []
     text = util.read_text(path)
     rel = config.rel_to_root(task, path)
     try:
@@ -148,15 +158,14 @@ def synth_patch(task: "config.Task", finding: "verifier.Finding") -> Optional[Pa
     body = text[fstart:fend]
     err_ret = _pick_error_return(text)
     lines = text.splitlines(keepends=True)
-    lo = text[:fstart].count("\n")          # 0-based first line of function
-    hi = text[:fend].count("\n")            # 0-based last line of function
-    insert_at = None      # 0-based line index to insert BEFORE
-    guard = None
+    lo = text[:fstart].count("\n")
+    hi = text[:fend].count("\n")
+    out: List[PatchResult] = []
 
-    # Strategy C: out-of-bounds READ of the input buffer (e.g. a loop that
-    # trusts a header count and indexes past the data actually supplied).
-    # Fix = bound the access by the size parameter; `break` inside a loop
-    # preserves clamp semantics, otherwise reject the input.
+    def indent_of(i):
+        return re.match(r"\s*", lines[i]).group(0)
+
+    # ---- Strategy C: out-of-bounds READ of the input buffer --------------
     if (finding.access or "").lower().startswith("read") and 0 < line_no <= len(lines):
         header = text[max(0, text.rfind("\n", 0, fstart) - 400):fstart]
         sig = re.search(r"\(\s*const\s+(?:unsigned\s+char|uint8_t|char)\s*\*\s*(\w+)\s*,"
@@ -167,71 +176,153 @@ def synth_patch(task: "config.Task", finding: "verifier.Finding") -> Optional[Pa
             am = re.search(r"\b%s\s*\[\s*([^\]]+?)\s*\]" % re.escape(buf), crash_line)
             if am:
                 idx_expr = am.group(1).strip()
-                indent = re.match(r"\s*", crash_line).group(0)
-                # inside a loop? look upward for a for/while at shallower indent
+                ind = indent_of(line_no - 1)
                 in_loop = False
                 for j in range(line_no - 2, lo - 1, -1):
-                    lj = lines[j]
-                    ind_j = len(re.match(r"\s*", lj).group(0))
-                    if ind_j < len(indent) and re.search(r"\b(for|while)\s*\(", lj):
+                    ind_j = len(indent_of(j))
+                    if ind_j < len(ind) and re.search(r"\b(for|while)\s*\(", lines[j]):
                         in_loop = True
                         break
-                    if ind_j < len(indent) and re.search(r"^\s*\}", lj):
+                    if ind_j < len(ind) and re.search(r"^\s*\}", lines[j]):
                         break
-                action = "break;" if in_loop else err_ret
-                insert_at = line_no - 1
-                guard = "%sif (%s >= %s) %s\n" % (indent, idx_expr, size_name, action)
+                root = _first_assignment_line(lines, lo, hi, idx_expr) or line_no
+                g1 = "%sif (%s >= %s) %s\n" % (ind, idx_expr, size_name,
+                                                 "break;" if in_loop else err_ret)
+                out.append(_make_result(lines, rel, line_no - 1, g1, "bound read at use site",
+                                        "use-site", root,
+                                        "Bound the input-buffer index by the available size "
+                                        "immediately before the out-of-bounds read."))
+                return out
 
-    # Strategy B: unchecked memcpy length
+    # ---- Strategy B: unchecked memcpy length ------------------------------
     mm = re.search(r"memcpy\s*\(\s*([^,]+),\s*[^,]+,\s*([^)]+)\)", body)
-    if insert_at is None and mm:
+    if mm:
         dst, length = mm.group(1).strip(), mm.group(2).strip()
-        # capacity: array field decl "... name[CAP];" for the dst field name
         field = dst.split("->")[-1].split(".")[-1].strip()
         fm = re.search(r"\b%s\s*\[\s*(\w+)\s*\]" % re.escape(field), text)
         capname = fm.group(1) if fm else (_macro_value_name(text, []) or "sizeof(%s)" % dst)
-        # cleanup (free) if the function allocates
         free_m = re.search(r"free\s*\(\s*(\w+)\s*\)", body)
         cleanup = ("free(%s); " % free_m.group(1)) if free_m else ""
-        for i in range(lo, min(hi + 1, len(lines))):
-            if "memcpy(" in lines[i]:
-                insert_at = i
-                indent = re.match(r"\s*", lines[i]).group(0)
-                guard = ("%sif (%s > %s) { %s%s }\n"
-                         % (indent, length, capname, cleanup, err_ret))
-                break
+        use_i = next((i for i in range(lo, min(hi + 1, len(lines))) if "memcpy(" in lines[i]), None)
+        root = _first_assignment_line(lines, lo, hi, length)
+        if use_i is not None:
+            g = "%sif (%s > %s) { %s%s }\n" % (indent_of(use_i), length, capname, cleanup, err_ret)
+            out.append(_make_result(lines, rel, use_i, g, "length check at copy site", "use-site",
+                                    root, "Reject records whose declared length exceeds the "
+                                    "fixed field capacity, immediately before the copy."))
+            if root and root - 1 != use_i and lo <= root - 1 <= hi:
+                # root-cause site: right after the length is read from input
+                ins = root            # insert AFTER the assignment line (0-based idx = root)
+                g2 = "%sif (%s > %s) { %s%s }\n" % (indent_of(root - 1), length, capname, cleanup, err_ret)
+                out.append(_make_result(lines, rel, ins, g2, "length check where length is read",
+                                        "root-cause", root,
+                                        "Validate the declared length at the point it is read "
+                                        "from the input, before any use."))
+            return out
 
-    # Strategy A: loop writing fixed array indexed by attacker count
-    if insert_at is None:
-        lm = re.search(r"for\s*\(\s*\w[\w\s]*=\s*0\s*;\s*\w+\s*<\s*(\w+)\s*;", body)
-        if lm:
-            count = lm.group(1)
-            dm = (re.search(r"\[\s*([A-Z_][A-Z0-9_]*)\s*\]", body)
-                  or re.search(r"\[\s*(\d+)\s*\]", body))
-            capname = dm.group(1) if dm else (_macro_value_name(text, []) or "16")
-            for i in range(lo, min(hi + 1, len(lines))):
-                if re.search(r"for\s*\(.*<\s*%s\s*;" % re.escape(count), lines[i]):
-                    insert_at = i
-                    indent = re.match(r"\s*", lines[i]).group(0)
-                    guard = ("%sif (%s > %s) %s\n"
-                             % (indent, count, capname, err_ret))
-                    break
+    # ---- Strategy A: loop writing a fixed array indexed by an input count --
+    lm = re.search(r"for\s*\(\s*\w[\w\s]*=\s*0\s*;\s*\w+\s*<\s*(\w+)\s*;", body)
+    if lm:
+        count = lm.group(1)
+        dm = (re.search(r"\[\s*([A-Z_][A-Z0-9_]*)\s*\]", body)
+              or re.search(r"\[\s*(\d+)\s*\]", body))
+        capname = dm.group(1) if dm else (_macro_value_name(text, []) or "16")
+        loop_i = next((i for i in range(lo, min(hi + 1, len(lines)))
+                       if re.search(r"for\s*\(.*<\s*%s\s*;" % re.escape(count), lines[i])), None)
+        root = _first_assignment_line(lines, lo, hi, count)
+        if loop_i is not None:
+            out.append(_make_result(lines, rel, loop_i,
+                                    "%sif (%s > %s) %s\n" % (indent_of(loop_i), count, capname, err_ret),
+                                    "count check before loop", "use-site", root,
+                                    "Reject inputs whose declared count exceeds the fixed "
+                                    "table capacity, immediately before the decode loop."))
+            if root and lo <= root - 1 <= hi and root - 1 != loop_i:
+                out.append(_make_result(lines, rel, root,
+                                        "%sif (%s > %s) %s\n" % (indent_of(root - 1), count, capname, err_ret),
+                                        "count check where count is read", "root-cause", root,
+                                        "Validate the declared count at the point it is read "
+                                        "from the header, before any use."))
+                out.append(_make_result(lines, rel, root,
+                                        "%sif (%s > %s) %s = %s;\n" % (indent_of(root - 1), count, capname, count, capname),
+                                        "clamp count to capacity", "clamp", root,
+                                        "Clamp the declared count to the table capacity "
+                                        "(silently truncates oversized inputs)."))
+    return out
 
-    if insert_at is None or guard is None:
-        return None
 
-    patched = lines[:insert_at] + [guard] + lines[insert_at:]
-    diff = "".join(difflib.unified_diff(
-        lines, patched, fromfile="a/" + rel, tofile="b/" + rel, n=3))
-    rationale = ("Insert a guard that rejects inputs whose attacker-controlled "
-                 "size exceeds the fixed buffer capacity, at the root cause in "
-                 "%s, before the out-of-bounds write." % rel)
-    return PatchResult(diff=diff, rel_path=rel, source="offline-heuristic",
-                       attempts=1, rationale=rationale, rejected=[])
+def synth_patch(task: "config.Task", finding: "verifier.Finding") -> Optional[PatchResult]:
+    """Single best-guess heuristic patch (use-site guard); kept for callers
+    and tests that want one candidate."""
+    v = synth_variants(task, finding)
+    return v[0] if v else None
 
 
 def fstart_line(text: str, char_off: int) -> int:
     return text[:char_off].count("\n") + 1
+
+
+def _first_assignment_line(lines: List[str], lo: int, hi: int, var: str) -> int:
+    """1-based line where `var` (e.g. n_channels, rec->length, idx) is first
+    assigned inside the function spanning lines lo..hi (0-based)."""
+    v = re.escape(var.split("->")[-1].split(".")[-1])
+    pat = re.compile(r"(^|[^\w])%s\s*=[^=]" % v)
+    for i in range(lo, min(hi + 1, len(lines))):
+        if pat.search(lines[i]):
+            return i + 1
+    return 0
+
+
+def _make_result(lines, rel, insert_at, guard, label, strategy, root_line,
+                 rationale) -> PatchResult:
+    patched = lines[:insert_at] + [guard] + lines[insert_at:]
+    diff = "".join(difflib.unified_diff(
+        lines, patched, fromfile="a/" + rel, tofile="b/" + rel, n=3))
+    gl = insert_at + 1
+    return PatchResult(diff=diff, rel_path=rel, source="offline-heuristic",
+                       attempts=1, rationale=rationale, rejected=[],
+                       label=label, strategy=strategy, guard_line=gl,
+                       root_cause_line=root_line or gl, distance=abs(gl - (root_line or gl)),
+                       added_lines=1)
+
+
+def annotate(task: "config.Task", finding: "verifier.Finding", pr: PatchResult) -> PatchResult:
+    """Fill guard_line / root_cause_line / distance / added_lines for any
+    candidate (e.g. a model-written diff) from its hunk and the source."""
+    added = [l[1:] for l in pr.diff.splitlines() if l.startswith("+") and not l.startswith("+++")]
+    pr.added_lines = len(added)
+    m = re.search(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", pr.diff, re.MULTILINE)
+    if not m:
+        return pr
+    start = int(m.group(1))
+    # guard line = position of the first added line within the hunk (new side)
+    new_line = start
+    for l in pr.diff.splitlines():
+        if l.startswith("@@"):
+            new_line = start
+            continue
+        if l.startswith("+++") or l.startswith("---"):
+            continue
+        if l.startswith("+"):
+            pr.guard_line = new_line
+            break
+        if not l.startswith("-"):
+            new_line += 1
+    # controlling variable = identifier compared in the first added if(...)
+    cond = next((a for a in added if re.search(r"\bif\s*\(", a)), "")
+    cm = re.search(r"if\s*\(\s*([\w\->\.\[\]]+)\s*[<>]=?", cond)
+    path = _find_source(task, finding)
+    if cm and path:
+        text = util.read_text(path)
+        lines = text.splitlines(keepends=True)
+        try:
+            ln = int(finding.crash_file.split(":")[1])
+        except (IndexError, ValueError):
+            ln = 1
+        fs, fe = _function_bounds(text, ln)
+        lo, hi = text[:fs].count("\n"), text[:fe].count("\n")
+        pr.root_cause_line = _first_assignment_line(lines, lo, hi, cm.group(1)) or pr.guard_line
+        pr.distance = abs(pr.guard_line - pr.root_cause_line)
+    return pr
 
 
 # ---------------------------------------------------------------------------
@@ -319,3 +410,74 @@ def propose(task: "config.Task", finding: "verifier.Finding",
         h.attempts = (attempts if rejected else 0) + 1
         return h
     return None
+
+
+# ---------------------------------------------------------------------------
+# Ensemble: several candidates from the model + the heuristic brain
+# ---------------------------------------------------------------------------
+def _ensemble_prompt(task, finding, rel, prior_reason: Optional[str]) -> str:
+    base = _prompt(task, finding, rel, prior_reason)
+    return base + (
+        "\n\nProvide up to 3 ALTERNATIVE patches. For each, write a heading line "
+        "exactly '### STRATEGY: <short name>' followed by a fenced unified diff. "
+        "Prefer, in order: (1) validate the untrusted value at the point it is read "
+        "from the input; (2) a guard immediately before the unsafe use; (3) any "
+        "other minimal, behaviour-preserving construction. Each diff must stand alone.")
+
+
+def _split_strategies(text: str) -> List[Tuple[str, str]]:
+    parts = re.split(r"^###\s*STRATEGY:\s*(.+?)\s*$", text, flags=re.MULTILINE)
+    out: List[Tuple[str, str]] = []
+    if len(parts) >= 3:
+        for i in range(1, len(parts) - 1, 2):
+            out.append((parts[i].strip()[:40], _extract_diff(parts[i + 1])))
+    else:
+        out.append(("model patch", _extract_diff(text)))
+    return [(n, d) for n, d in out if d.strip()]
+
+
+def propose_ensemble(task: "config.Task", finding: "verifier.Finding",
+                     client: "llm.LLMClient", attempts: int = 2,
+                     max_candidates: int = 5) -> List[PatchResult]:
+    """Collect candidate patches: model strategies (1 call, + 1 reflection
+    call if none passed policy) and the heuristic brain's variants."""
+    rel = config.rel_to_root(task, _find_source(task, finding) or finding.crash_file)
+    cands: List[PatchResult] = []
+    rejected: List[str] = []
+    reason = None
+    for attempt in range(1, attempts + 1):
+        try:
+            text = client.complete(_ensemble_prompt(task, finding, rel, reason),
+                                   system=PATCH_SYSTEM, max_tokens=2000)
+        except llm.LLMUnavailable:
+            break
+        got_valid = False
+        for name, diff in _split_strategies(text):
+            why = check_policy(task, diff)
+            if why is None:
+                pr = PatchResult(diff=diff, rel_path=rel, source=client.last_source,
+                                 attempts=attempt, rejected=list(rejected),
+                                 rationale="Model-proposed: %s" % name,
+                                 label="LLM: " + name, strategy="llm")
+                cands.append(annotate(task, finding, pr))
+                got_valid = True
+            else:
+                rejected.append("attempt %d [%s]: %s" % (attempt, name, why))
+        if got_valid:
+            break
+        reason = "; ".join(rejected[-3:])
+    seen = {c.diff for c in cands}
+    for v in synth_variants(task, finding):
+        if v.diff not in seen:
+            v.rejected = list(rejected) if not cands else []
+            cands.append(v)
+            seen.add(v.diff)
+    return cands[:max_candidates]
+
+
+STRATEGY_PENALTY = {"clamp": 1}   # silently altering data ranks below an explicit reject
+
+
+def rank_key(pr: PatchResult, verified: bool):
+    return (0 if verified else 1, pr.distance, STRATEGY_PENALTY.get(pr.strategy, 0),
+            pr.added_lines, 0 if pr.strategy == "llm" else 1)

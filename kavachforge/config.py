@@ -49,6 +49,7 @@ class Task:
     diff_source: str = "task"       # "task" | "git" | <path to .diff>
     sarif_source: str = ""          # "" | <path to .sarif>
     changed_lines: Dict[str, List[int]] = field(default_factory=dict)
+    probe: Optional[str] = None     # absolute path to behaviour probe main, optional
 
     # budgets / limits (with defaults)
     time_budget_s: int = 60
@@ -86,6 +87,8 @@ def load_task(path: str, diff_override: Optional[str] = None,
     diff_src = diff_override or d.get("diff") or "task"
     if diff_src == "git":
         changed_lines = ingest.changed_files_from_git(root)
+    elif diff_src.startswith("git-range:"):
+        changed_lines = ingest.changed_files_from_git_range(root, diff_src.split(":", 1)[1])
     elif diff_src != "task":
         dp = diff_src if os.path.isabs(diff_src) else _abs(root, diff_src)
         if not os.path.exists(dp):
@@ -121,6 +124,7 @@ def load_task(path: str, diff_override: Optional[str] = None,
         diff_source=diff_src,
         sarif_source=sarif_src,
         changed_lines=changed_lines,
+        probe=(_abs(root, d["probe"]) if d.get("probe") else None),
         time_budget_s=int(budgets.get("time_budget_s", 60)),
         max_iters=int(budgets.get("max_iters", 200000)),
         rss_mb=int(budgets.get("rss_mb", 2048)),

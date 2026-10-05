@@ -31,6 +31,7 @@ class Validation:
     gates: List[Gate] = field(default_factory=list)
     worktree_kept: Optional[str] = None
     regress: Optional[object] = None  # regress.RegressResult when generated
+    diff: Optional[object] = None     # differential.DiffResult when run
 
     def as_dict(self) -> Dict:
         d = {"status": self.status,
@@ -45,6 +46,11 @@ class Validation:
                 "passes_patched": r.passes_patched,
                 "guards_bug": r.guards_bug,
             }
+        if self.diff is not None:
+            x = self.diff
+            d["differential"] = {"mode": x.mode, "compared": x.total,
+                                 "preserved": x.preserved, "excluded": x.excluded,
+                                 "diverged": x.diverged[:10], "passed": x.passed}
         return d
 
 
@@ -71,7 +77,8 @@ def baseline_tests(task: "config.Task", tc: "toolchain.Toolchain",
 
 
 def validate(task: "config.Task", tc: "toolchain.Toolchain", finding,
-             patch_diff: str, work_dir: str, keep: bool = False) -> Validation:
+             patch_diff: str, work_dir: str, keep: bool = False,
+             with_g5: bool = True) -> Validation:
     gates: List[Gate] = []
     os.makedirs(work_dir, exist_ok=True)
     worktree = tempfile.mkdtemp(prefix="kv_wt_", dir=os.path.abspath(work_dir))
@@ -125,9 +132,21 @@ def validate(task: "config.Task", tc: "toolchain.Toolchain", finding,
         from . import regress
         rr = regress.prove(task, tc, finding, dst, work_dir, worktree)
         gates.append(Gate("G4 regression test", rr.guards_bug, rr.detail))
-        # G0-G3 prove the patch; G4 proves the generated test. A G4 miss is
-        # reported on its gate but does not un-verify the patch itself.
-        return Validation("Verified", gates, worktree if keep else None, regress=rr)
+        if not with_g5:
+            return Validation("Verified", gates, worktree if keep else None, regress=rr)
+
+        # G5: behaviour preservation - replay the whole corpus through a
+        # behaviour probe on both trees; any divergence on a previously-valid
+        # input is functionality loss and rejects the patch.
+        from . import differential
+        dr = differential.compare(task, tc, dst, work_dir, worktree,
+                                  os.path.join(work_dir, "fuzzer"), out_bin)
+        gates.append(Gate("G5 behaviour preserved", dr.passed or dr.mode == "skipped",
+                          dr.detail))
+        status = "Verified" if (dr.passed or dr.mode == "skipped") else "Rejected"
+        # G0-G3 + G5 prove the patch; G4 proves the generated test (a G4 miss is
+        # reported on its gate but does not un-verify the patch itself).
+        return Validation(status, gates, worktree if keep else None, regress=rr, diff=dr)
     finally:
         if not keep:
             shutil.rmtree(worktree, ignore_errors=True)

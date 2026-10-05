@@ -68,6 +68,23 @@ def changed_files_from_git(root: str) -> Dict[str, List[int]]:
     return changed_files_from_diff_text(r.out)
 
 
+def changed_files_from_git_range(root: str, base: str) -> Dict[str, List[int]]:
+    """Diff of the target between `base` (merge-base with HEAD) and HEAD, with
+    paths relative to the target root - what a CI run on a pull request needs."""
+    r = util.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"])
+    if not r.ok:
+        return {}
+    r = util.run(["git", "-C", root, "diff", "%s...HEAD" % base, "--relative",
+                  "--unified=0", "--no-color", "--", "."])
+    if not r.ok or not r.out.strip():
+        # fall back to a plain two-dot diff (e.g. shallow clone without merge-base)
+        r = util.run(["git", "-C", root, "diff", base, "HEAD", "--relative",
+                      "--unified=0", "--no-color", "--", "."])
+        if not r.ok:
+            return {}
+    return changed_files_from_diff_text(r.out)
+
+
 def alerts_from_sarif(path: str, root: Optional[str] = None) -> List[Dict]:
     """Flatten SARIF results into [{file, line, rule, level}] with file paths
     made relative to `root` when possible."""

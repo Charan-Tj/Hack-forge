@@ -1,0 +1,96 @@
+name: KavachForge security check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      all:
+        description: "Run every bundled target"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  kavachforge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain (clang + libFuzzer runtime)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q clang llvm patch
+          sudo apt-get install -y -q libclang-rt-dev || sudo apt-get install -y -q libclang-rt-18-dev
+
+      - name: Environment check & self-tests
+        run: |
+          ./kavach doctor
+          ./kavach selftest
+
+      - name: Run KavachForge on the change
+        id: kv
+        env:
+          KAVACH_LLM_PROVIDER: ${{ secrets.ANTHROPIC_API_KEY != '' && 'anthropic' || 'offline' }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set +e
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            ./kavach ci --base "origin/${{ github.base_ref }}"
+          else
+            ./kavach ci --all --fail-on none
+          fi
+          echo "rc=$?" >> "$GITHUB_OUTPUT"
+          cat artifacts/ci-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence bundles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kavachforge-evidence
+          path: |
+            artifacts/**/evidence.json
+            artifacts/**/dashboard.html
+            artifacts/**/manifest.json
+            artifacts/**/run.log
+            artifacts/**/pr/**
+            artifacts/**/regress/**
+            artifacts/ci-summary.md
+            artifacts/ci-result.json
+            artifacts/ci-fix/**
+
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file artifacts/ci-summary.md
+
+      - name: Open a fix pull request (when a verified fix exists)
+        if: hashFiles('artifacts/ci-fix/*.patch') != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          git config user.name "kavachforge[bot]"
+          git config user.email "kavachforge@users.noreply.github.com"
+          BR="kavachforge/fix-${{ github.run_id }}"
+          git checkout -b "$BR"
+          for p in artifacts/ci-fix/*.patch; do patch -p1 < "$p"; done
+          git add targets
+          git commit -m "KavachForge: verified fix + regression test (run ${{ github.run_id }})"
+          git push -u origin "$BR"
+          BODY=$(ls artifacts/*/pr/*/PR.md | head -1)
+          gh pr create --title "KavachForge: verified security fix" --body-file "$BODY" \
+            --base "${{ github.event.pull_request.head.ref || github.ref_name }}" --head "$BR" \
+            || echo "::warning::could not open a fix PR (enable 'Allow GitHub Actions to create pull requests' in repo settings); the patch is attached as an artifact"
+
+      - name: Enforce result
+        run: exit ${{ steps.kv.outputs.rc }}

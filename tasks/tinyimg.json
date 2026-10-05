@@ -30,5 +30,6 @@
     "max_iters": 150000,
     "rng_seed": 1337
   },
-  "diff": "changes/add-channel-table.diff"
+  "diff": "changes/add-channel-table.diff",
+  "probe": "harness/probe_tinyimg.c"
 }

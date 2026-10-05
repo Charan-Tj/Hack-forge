@@ -229,37 +229,80 @@ def run_task(task_path: str, out_root: str = "artifacts",
                       for f in findings]
         P.set("verify", "done")
 
-        # ---- Stage 5: patch + validate -------------------------------------
+        # ---- Stage 5: patch ensemble + validate + rank --------------------
         P.set("repair", "running" if findings else "skipped")
         for idx, f in enumerate(findings):
-            util.stage("Repair & verify — %s" % f.id)
-            pr_res = patcher.propose(task, f, client, attempts=2)
-            validation = {"status": "Unpatched", "gates": []}
-            v = None
-            if pr_res is None:
-                util.warn("no patch could be synthesized")
-            else:
-                util.step("patch via %s (%d attempt(s))" % (pr_res.source, pr_res.attempts))
-                for rej in pr_res.rejected:
-                    util.step(util.dim("reflected: " + rej))
-                v = validator.validate(task, tc, f, pr_res.diff, work_dir,
-                                       keep=keep_worktree)
-                validation = v.as_dict()
-                for g in v.gates:
-                    (util.good if g.passed else util.bad)("%s — %s" % (g.name, g.detail))
-                if v.status == "Verified":
-                    util.good(util.green("PATCH VERIFIED — builds, blocks PoV, tests pass"))
-                    if v.regress is not None and v.regress.guards_bug:
-                        util.good(util.green("REGRESSION TEST PROVEN — %s"
-                                             % os.path.basename(v.regress.source_path)))
-                else:
-                    util.bad("patch rejected at an evidence gate")
-            fd = _finding_dict(f, work_dir, pr_res, validation)
-            if pr_res is not None and validation.get("status") == "Verified":
-                rs = v.regress.source_path if v.regress is not None else None
-                fd["pr_bundle"] = pr.build(task, f, fd["patch"], validation, rs,
-                                           work_dir, __version__)
-                util.good("PR bundle: %s" % fd["pr_bundle"]["dir"])
+            util.stage("Repair ensemble & verify \u2014 %s" % f.id)
+            cands = patcher.propose_ensemble(task, f, client, attempts=2)
+            if not cands:
+                util.warn("no patch candidates could be synthesized")
+                P.findings[idx] = _finding_dict(f, work_dir, None,
+                                                {"status": "Unpatched", "gates": []})
+                P.publish()
+                continue
+            util.step("%d candidate(s): %s" % (len(cands), "; ".join(c.label for c in cands)))
+            for rej in (cands[0].rejected or []):
+                util.step(util.dim("reflected: " + rej))
+
+            # Phase 1: executable gates G0-G4 on every candidate (fast).
+            results = []
+            for c in cands:
+                v = validator.validate(task, tc, f, c.diff, work_dir,
+                                       keep=keep_worktree, with_g5=False)
+                results.append((c, v))
+                failed = next((g.name for g in v.gates if not g.passed), None)
+                util.step("%-38s %s" % (c.label, util.green("G0-G4 pass") if v.status == "Verified"
+                                        else util.red("rejected at " + str(failed))))
+            # Phase 2: rank survivors by root-cause proximity; prove the top
+            # one with G5 (behaviour preservation), falling through on failure.
+            ranked = sorted(results, key=lambda cv: patcher.rank_key(cv[0], cv[1].status == "Verified"))
+            winner = None
+            final_v = None
+            cand_rows = []
+            for rank, (c, v) in enumerate(ranked, 1):
+                row = {"rank": rank, "label": c.label, "strategy": c.strategy,
+                       "source": c.source, "guard_line": c.guard_line,
+                       "root_cause_line": c.root_cause_line, "distance": c.distance,
+                       "added_lines": c.added_lines, "status": v.status,
+                       "gates": v.as_dict()["gates"], "chosen": False, "diff": c.diff}
+                if winner is None and v.status == "Verified":
+                    v5 = validator.validate(task, tc, f, c.diff, work_dir,
+                                            keep=keep_worktree, with_g5=True)
+                    row["gates"] = v5.as_dict()["gates"]
+                    row["status"] = v5.status
+                    g5 = next((g for g in v5.gates if g.name.startswith("G5")), None)
+                    if v5.status == "Verified":
+                        winner, final_v = c, v5
+                        row["chosen"] = True
+                        util.good("#%d %s \u2014 G5 %s" % (rank, c.label, g5.detail if g5 else ""))
+                    else:
+                        util.bad("#%d %s \u2014 G5 rejected: %s" % (rank, c.label, g5.detail if g5 else ""))
+                cand_rows.append(row)
+
+            if winner is None:
+                util.bad("no candidate survived all gates")
+                best_c, best_v = ranked[0]
+                fd = _finding_dict(f, work_dir, best_c, best_v.as_dict())
+                fd["validation"]["status"] = "Rejected"
+                fd["candidates"] = cand_rows
+                P.findings[idx] = fd
+                P.publish()
+                continue
+
+            validation = final_v.as_dict()
+            for g in final_v.gates:
+                (util.good if g.passed else util.bad)("%s \u2014 %s" % (g.name, g.detail))
+            util.good(util.green("PATCH VERIFIED \u2014 chose #%d '%s' (guard %d line(s) from root cause)"
+                                 % (next(r["rank"] for r in cand_rows if r["chosen"]), winner.label,
+                                    winner.distance)))
+            if final_v.regress is not None and final_v.regress.guards_bug:
+                util.good(util.green("REGRESSION TEST PROVEN \u2014 %s"
+                                     % os.path.basename(final_v.regress.source_path)))
+            fd = _finding_dict(f, work_dir, winner, validation)
+            fd["candidates"] = cand_rows
+            rs = final_v.regress.source_path if final_v.regress is not None else None
+            fd["pr_bundle"] = pr.build(task, f, fd["patch"], validation, rs, work_dir, __version__)
+            util.good("PR bundle: %s" % fd["pr_bundle"]["dir"])
             P.findings[idx] = fd
             P.publish()
         if findings:

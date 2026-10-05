@@ -278,6 +278,14 @@ def _cmd_reset(args) -> int:
     return 0
 
 
+def _cmd_ci(args) -> int:
+    from . import ci
+    if args.provider:
+        os.environ["KAVACH_LLM_PROVIDER"] = args.provider
+    return ci.run(args.base, args.all, args.fail_on, provider=args.provider,
+                  budget=args.budget)
+
+
 def _cmd_selftest(args) -> int:
     import unittest
     here = os.path.dirname(os.path.abspath(__file__))
@@ -336,6 +344,17 @@ def main(argv=None) -> int:
     sp = sub.add_parser("reset", help="restore a watched target to its baseline")
     sp.add_argument("task", nargs="?", default="cleanjson")
     sp.set_defaults(func=_cmd_reset)
+
+    sp = sub.add_parser("ci", help="pull-request check: run on changed targets, "
+                        "write a summary, emit fix patches, set exit code")
+    sp.add_argument("--base", default=None, help="base ref (default origin/main)")
+    sp.add_argument("--all", action="store_true", help="run every target")
+    sp.add_argument("--fail-on", choices=["any", "unverified", "none"], default="any",
+                    help="fail the check on any finding (default), only on "
+                         "unverified ones, or never")
+    sp.add_argument("--provider", default=None)
+    sp.add_argument("--budget", type=int, default=6)
+    sp.set_defaults(func=_cmd_ci)
 
     sp = sub.add_parser("doctor", help="check environment")
     sp.add_argument("--engine", choices=["libfuzzer", "standalone"], default=None)
