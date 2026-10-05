@@ -53,7 +53,8 @@ HARNESS_SYM = "LLVMFuzzerTestOneInput"
 _MAIN_RE = re.compile(r"\bint\s+main\s*\(")
 _MULTI_RE = re.compile(r"multiple definition of [`'](\w+)'")
 _MULTI_FILE_RE = re.compile(r"([^\s:(]+\.o)\)?:")
-_UNDEF_RE = re.compile(r"undefined reference to [`'](\w+)'")
+_UNDEF_RE = re.compile(r"undefined reference to (?:symbol )?[`'](\w+)(?:@@?[\w.]+)?'")
+_DSO_RE = re.compile(r"lib(\w+)\.so(?:\.\d+)*: error adding symbols: DSO missing from command line")
 _UNDEF_SYM_RE = re.compile(r"undefined symbol:?\s*(\w+)")
 _LIB_HINTS = [
     ("-lm", {"sin", "cos", "tan", "pow", "sqrt", "exp", "log", "fabs", "floor",
@@ -380,6 +381,13 @@ def build_fix(tc, root: str, kept_abs: List[str], harness: str, incs: List[str],
             if changed:
                 continue
             undef = _undefined(err)
+            # gcc/ld spell a missing shared lib as "libm.so.6: ... DSO missing"
+            for dso in _DSO_RE.findall(err):
+                lib = "-l" + dso
+                if lib not in tried_libs:
+                    link_flags.append(lib); tried_libs.add(lib); changed = True
+            if changed:
+                continue
             if undef:
                 for lib, syms in _LIB_HINTS:
                     if lib not in tried_libs and any(u in syms or u.rstrip("f") in syms or u.lstrip("_") in syms for u in undef):
@@ -593,7 +601,9 @@ def onboard(spec: str, name: Optional[str] = None, harness_sel: Optional[str] = 
             ob.detail = "harness synthesis failed: " + syn.detail
             return ob
         ob.synthesized = True
-        ob.note("synthesized harness: " + syn.detail)
+        ob.note("synthesized harness: entry '%s' (%s)%s" % (
+            syn.entry.name, syn.entry.shape,
+            "" if syn.validated else " - single-file validation failed, re-validated by build-fix below"))
         harnesses = [os.path.relpath(syn.harness_path, root)]
         # synthesize() wrote a task for a single file; we overwrite it below
         probe = syn.probe_path or None

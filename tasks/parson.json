@@ -1,0 +1,28 @@
+{
+  "name": "parson",
+  "language": "c",
+  "description": "parson (onboarded, synthesized harness; harness fuzz_parson.c)",
+  "root": "/tmp/onb/parson",
+  "sources": [
+    "parson.c"
+  ],
+  "include_dirs": [
+    "."
+  ],
+  "harness": ".kavach/harness/fuzz_parson.c",
+  "test_sources": [],
+  "patch_scope": [
+    "parson.c"
+  ],
+  "magic": null,
+  "static_alerts": [],
+  "seeds": [],
+  "budgets": {
+    "time_budget_s": 60,
+    "rng_seed": 1337
+  },
+  "link_flags": [],
+  "_onboarded": true,
+  "probe": ".kavach/harness/probe_parson.c",
+  "diff": "git"
+}
