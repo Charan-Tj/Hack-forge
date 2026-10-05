@@ -1,0 +1,18 @@
+diff --git a/src/tinyimg.c b/src/tinyimg.c
+--- a/src/tinyimg.c
++++ b/src/tinyimg.c
+@@ -36,11 +36,13 @@ int tinyimg_parse(const uint8_t *data, size_t size, tinyimg_info *out) {
+     struct { uint8_t id; uint8_t depth; } channels[TINYIMG_MAX_CHANNELS];
+
+     /* Need enough bytes for the declared channel table. */
+     if (size < (size_t)6 + (size_t)n_channels * 2) return TINYIMG_ERR_SHORT;
+
+-    /* (channel table decoding not yet implemented) */
++    /* VULN: n_channels is not clamped to TINYIMG_MAX_CHANNELS. */
++    for (uint8_t i = 0; i < n_channels; i++) {
++        channels[i].id    = data[6 + i * 2];
++        channels[i].depth = data[6 + i * 2 + 1];
++    }
+
+     out->version    = version;
+     out->n_channels = n_channels;

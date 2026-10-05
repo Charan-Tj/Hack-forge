@@ -1,67 +1,70 @@
-# KavachForge — Run Anywhere (day-of cheat sheet)
+# KavachForge — Showcase Runbook (keep open at the finale)
 
-Keep this open during the finale. Two ways to run; pick whichever the laptop supports.
-
-## Option A — Docker (most reliable, works on any OS)
-Needs only Docker Desktop installed and running.
-
+## 60 seconds before the judges arrive
 ```bash
 cd kavachforge
-./kavach --docker demo        # builds image on first run (~2 min), then runs
-./kavach --docker serve       # open http://localhost:8777
+./kavach doctor          # must say READY
+./kavach selftest        # must say OK
+./kavach showcase --fresh
 ```
+Open **http://localhost:8777** in a browser on the big screen *before* the run finishes
+— the index and each dashboard update live. Leave the terminal visible next to it.
 
-That's it. The image carries clang + libFuzzer + AddressSanitizer, so the
-coverage-guided engine runs identically on any judge's machine.
+## Option A — Docker (identical on any OS; coverage-guided libFuzzer engine)
+Needs only Docker Desktop running.
+```bash
+./kavach --docker showcase        # first run builds the image (~2 min)
+```
+The container maps port 8777 and writes `artifacts/` to the host, so the dashboard
+URL is the same.
 
 ## Option B — Native (no Docker)
-Needs: Python 3.9+, `patch`, and a C compiler with AddressSanitizer.
-
+Needs Python 3.9+, `patch`, and a C compiler with AddressSanitizer.
 ```bash
-# macOS:   xcode-select --install     (clang) ; gcc also fine via brew
-# Ubuntu:  sudo apt-get install -y clang llvm libclang-rt-dev patch
-#          (or: sudo apt-get install -y gcc patch)
-cd kavachforge
-./kavach doctor               # confirms the toolchain is ready
-./kavach demo
-./kavach serve                # http://localhost:8777
+# macOS:   xcode-select --install
+# Ubuntu:  sudo apt-get install -y clang llvm libclang-rt-dev patch   # libFuzzer engine
+#          (gcc + patch alone also works: standalone engine)
+./kavach doctor && ./kavach showcase --fresh
 ```
 
-## The safe demo (no internet, no API key, identical every time)
+## If the venue network is down or you have no API key
+Nothing changes — the offline brain and the prompt cache take over automatically.
+For a 100% deterministic run (identical numbers every time):
 ```bash
-./kavach replay               # deterministic offline run of all targets
+./kavach replay
 ```
-Use this if the venue Wi-Fi is flaky or you don't want any live dependency.
-It still shows discovery → classification → **Verified patch** → clean control.
 
-## Showing a live LLM (optional, if network is available)
+## Showing a live model (optional)
 ```bash
-export ANTHROPIC_API_KEY=sk-...        # or OPENAI_API_KEY=...
-./kavach run tinyimg                   # seeds + patch come from the model
+export ANTHROPIC_API_KEY=sk-...   # or OPENAI_API_KEY=...
+./kavach showcase --fresh
 ```
-Falls back to the offline brain automatically if the call fails — the demo
-cannot break.
+Dashboards will say `model: anthropic / ...` and the patch card `source: live`.
+If the endpoint fails mid-run it falls back to cache/offline — the run completes.
 
-## If something goes wrong (90-second recovery)
-1. `./kavach doctor` — tells you exactly what's missing.
-2. No toolchain? → use **Option A (Docker)**.
-3. No Docker *and* no compiler? → run on the presenter's machine; artifacts in
-   `artifacts/` are pre-generated and `./kavach serve` still shows them.
-4. Wi-Fi down? → `./kavach replay` (offline, deterministic).
-5. Start clean: `./kavach clean && ./kavach demo`.
+## What to say while it runs (4 minutes)
+1. **Signals** — point at "Input signals": a real developer diff for `tinyimg`, a real
+   SARIF scan for `recordcfg`. "We start from what teams already have."
+2. **Risk ledger** — the parser is top: changed lines + copy/index sink + reachable from
+   the fuzz entry + scanner alert. Deterministic and explainable, before any LLM.
+3. **Discovery** — crash in ~0.1s; "46 raw crashes → 1 finding" is signature-level dedup.
+4. **Evidence** — PoV hash, repro command, CWE-787 + severity, root-cause line.
+5. **Repair** — minimal guard at the root cause; policy forbids touching tests/harness/flags;
+   if the model's first try is bad, the rejection reason is fed back (self-reflection).
+6. **Proof** — four gates go green: apply → rebuild → PoV blocked → tests pass → **VERIFIED**.
+7. **Control** — `cleanjson`: 10M+ execs, **no finding invented**. "We don't hallucinate bugs."
+8. **Boundary** — manifest hash, run log, LLM budget; human approves, nothing auto-deploys.
 
-## What to point the judges at
-- The terminal: each stage prints, ending in **PATCH VERIFIED** for two bugs and
-  **NO VERIFIED CRASH** for the clean control (no false positive).
-- The dashboard (`./kavach serve`): risk ledger, the four green gates, the unified
-  diff, the PoV hexdump, and the sanitizer report — the full evidence chain.
-- `artifacts/<target>/evidence.json`: the auditable record.
+## Likely judge questions (short answers)
+- *Real repos?* Yes: any libFuzzer/OSS-Fuzz-style harness; `--diff git --sarif file`.
+- *Why not just an LLM?* It hallucinates findings and "fixes" that hide tests. We gate on
+  executable proof.
+- *Scale?* Stateless per target, filesystem coordination; parallelize by running tasks on
+  separate runners. Roadmap: CI/PR integration, CodeQL reachability, Java/Python.
+- *Air-gapped?* Yes — local Ollama model or offline brain; no network needed.
 
-## One-liners
-```bash
-./kavach demo                 # everything
-./kavach run recordcfg        # single target, full loop
-./kavach replay               # offline deterministic
-./kavach --docker demo        # containerized
-make demo | make docker-demo  # same via Makefile
-```
+## 90-second recovery
+1. `./kavach doctor` tells you what's missing.
+2. No compiler → `./kavach --docker showcase`. No Docker either → `./kavach serve`
+   shows the last good artifacts.
+3. Anything odd → `./kavach clean && ./kavach replay`.

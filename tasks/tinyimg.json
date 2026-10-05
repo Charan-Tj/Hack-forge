@@ -3,16 +3,32 @@
   "language": "c",
   "description": "Binary image channel-table parser (magic-gated header)",
   "root": "targets/tinyimg",
-  "sources": ["src/tinyimg.c"],
-  "include_dirs": ["src"],
-  "harness": "harness/fuzz_tinyimg.c",
-  "test_sources": ["src/tinyimg.c", "tests/test_tinyimg.c"],
-  "patch_scope": ["src/tinyimg.c"],
-  "magic": "TIMG",
-  "diff_changed": ["src/tinyimg.c"],
-  "static_alerts": [
-    {"file": "src/tinyimg.c", "line": 46,
-     "rule": "CWE-787: write to fixed-size channel array indexed by attacker-controlled count"}
+  "sources": [
+    "src/tinyimg.c"
   ],
-  "budgets": {"time_budget_s": 45, "max_iters": 150000, "rng_seed": 1337}
+  "include_dirs": [
+    "src"
+  ],
+  "harness": "harness/fuzz_tinyimg.c",
+  "test_sources": [
+    "src/tinyimg.c",
+    "tests/test_tinyimg.c"
+  ],
+  "patch_scope": [
+    "src/tinyimg.c"
+  ],
+  "magic": "TIMG",
+  "static_alerts": [
+    {
+      "file": "src/tinyimg.c",
+      "line": 46,
+      "rule": "CWE-787: write to fixed-size channel array indexed by attacker-controlled count"
+    }
+  ],
+  "budgets": {
+    "time_budget_s": 45,
+    "max_iters": 150000,
+    "rng_seed": 1337
+  },
+  "diff": "changes/add-channel-table.diff"
 }

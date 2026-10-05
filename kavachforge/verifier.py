@@ -38,6 +38,7 @@ class Finding:
     repro_cmd: str = ""
     asan_report: str = ""
     root_cause: str = ""
+    duplicates: int = 0                # other raw crashes collapsed into this
 
 
 def _extract_class(blob: str) -> str:
@@ -79,7 +80,7 @@ def _signature(asan_class: str, frames: List[Dict]) -> str:
 def verify(task: "config.Task", fuzzer_bin: str,
            raw_crashes: List[Dict]) -> List[Finding]:
     source_basenames = {os.path.basename(s) for s in task.sources}
-    seen = {}
+    seen: Dict[str, Finding] = {}
     findings: List[Finding] = []
 
     for rc in raw_crashes:
@@ -94,8 +95,8 @@ def verify(task: "config.Task", fuzzer_bin: str,
         frames = _extract_frames(blob, source_basenames)
         sig = _signature(asan_class, frames)
         if sig in seen:
+            seen[sig].duplicates += 1
             continue
-        seen[sig] = True
 
         cls = cwe.classify(asan_class)
         op = _OP_RE.search(blob)
@@ -105,7 +106,7 @@ def verify(task: "config.Task", fuzzer_bin: str,
             data = f.read()
 
         fid = "KV-%s-%03d" % (task.name.upper()[:6], len(findings) + 1)
-        findings.append(Finding(
+        fnd = Finding(
             id=fid, signature=sig, asan_class=asan_class,
             cwe=cls["cwe"], cwe_name=cls["cwe_name"], severity=cls["severity"],
             access=access,
@@ -115,6 +116,8 @@ def verify(task: "config.Task", fuzzer_bin: str,
             pov_size=len(data),
             repro_cmd="%s %s" % (os.path.basename(fuzzer_bin), os.path.basename(pov)),
             asan_report=_trim_report(blob),
-        ))
+        )
+        seen[sig] = fnd
+        findings.append(fnd)
     findings.sort(key=lambda f: -cwe.severity_rank(f.severity))
     return findings

@@ -40,6 +40,38 @@ G_ARR = "→"    # arrow
 G_BAR = "━"    # heavy bar
 
 _STAGE = 0
+_LOG_FH = None          # optional run.log mirror
+_ANSI = None
+
+
+def set_log_file(path: Optional[str]) -> None:
+    """Mirror all console output into a plain-text run log (no ANSI)."""
+    global _LOG_FH
+    if _LOG_FH:
+        try:
+            _LOG_FH.close()
+        except Exception:
+            pass
+        _LOG_FH = None
+    if path:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        _LOG_FH = open(path, "a", encoding="utf-8")
+
+
+def _emit(line: str) -> None:
+    print(line)
+    if _LOG_FH:
+        global _ANSI
+        if _ANSI is None:
+            import re
+            _ANSI = re.compile(r"\033\[[0-9;]*m")
+        _LOG_FH.write(_ANSI.sub("", line) + "\n")
+        _LOG_FH.flush()
+
+
+def reset_stage_counter() -> None:
+    global _STAGE
+    _STAGE = 0
 
 
 def stage(title: str) -> None:
@@ -48,14 +80,15 @@ def stage(title: str) -> None:
     _STAGE += 1
     bar = G_BAR * max(4, 56 - len(title))
     label = bold("[%d] %s" % (_STAGE, title))
-    print("\n%s %s %s" % (blue(G_TRI), label, dim(bar)))
+    _emit("\n%s %s %s" % (blue(G_TRI), label, dim(bar)))
 
 
-def info(msg: str) -> None:  print("  " + msg)
-def good(msg: str) -> None:  print("  %s %s" % (green(G_CHK), msg))
-def warn(msg: str) -> None:  print("  %s %s" % (yellow(G_WRN), msg))
-def bad(msg: str) -> None:   print("  %s %s" % (red(G_X), msg))
-def step(msg: str) -> None:  print("  %s %s" % (dim(G_ARR), msg))
+def info(msg: str) -> None:  _emit("  " + msg)
+def good(msg: str) -> None:  _emit("  %s %s" % (green(G_CHK), msg))
+def warn(msg: str) -> None:  _emit("  %s %s" % (yellow(G_WRN), msg))
+def bad(msg: str) -> None:   _emit("  %s %s" % (red(G_X), msg))
+def step(msg: str) -> None:  _emit("  %s %s" % (dim(G_ARR), msg))
+def plain(msg: str) -> None: _emit(msg)
 
 
 # ---------------------------------------------------------------------------
@@ -73,8 +106,27 @@ class CmdResult:
         return self.code == 0
 
 
-def run(cmd, cwd=None, env=None, timeout=None, input_bytes=None) -> CmdResult:
-    """Run a command (list or str). Never raises on non-zero exit."""
+def _limiter(cpu_seconds):
+    """Build a preexec_fn applying a CPU-time rlimit (POSIX only)."""
+    if cpu_seconds is None or os.name != "posix":
+        return None
+    try:
+        import resource
+    except ImportError:
+        return None
+
+    def _apply():
+        try:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 5))
+        except (ValueError, OSError):
+            pass
+    return _apply
+
+
+def run(cmd, cwd=None, env=None, timeout=None, input_bytes=None,
+        cpu_seconds=None) -> CmdResult:
+    """Run a command (list or str). Never raises on non-zero exit.
+    `cpu_seconds` caps CPU time of the child (sandboxing untrusted inputs)."""
     shell = isinstance(cmd, str)
     full_env = dict(os.environ)
     if env:
@@ -84,6 +136,7 @@ def run(cmd, cwd=None, env=None, timeout=None, input_bytes=None) -> CmdResult:
         p = subprocess.run(
             cmd, cwd=cwd, env=full_env, shell=shell,
             capture_output=True, timeout=timeout, input=input_bytes,
+            preexec_fn=_limiter(cpu_seconds),
         )
         return CmdResult(
             p.returncode,

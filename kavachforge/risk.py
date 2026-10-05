@@ -81,8 +81,18 @@ def analyze(task: "config.Task", harness_text: str) -> List[Dict]:
                 continue
             body = _body(src, start)
             fr = FuncRisk(name=name, file=rel, line=line)
+            end_line = line + body.count("\n")
 
-            if rel in changed:
+            # Changed-code signal: function-level when the diff gives line
+            # numbers, file-level otherwise.
+            lines_changed = task.changed_lines.get(rel)
+            if lines_changed:
+                hits = [l for l in lines_changed if line <= l <= end_line]
+                if hits:
+                    fr.score += 4
+                    fr.components.append("+4 changed in diff (lines %s)"
+                                         % ",".join(str(h) for h in hits[:6]))
+            elif rel in changed:
                 fr.score += 4
                 fr.components.append("+4 in changed file (%s)" % rel)
 

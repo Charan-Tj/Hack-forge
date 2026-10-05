@@ -46,6 +46,9 @@ class Task:
     description: str
     seeds: List[str]                # absolute, optional provided seeds
     raw: dict = field(default_factory=dict)
+    diff_source: str = "task"       # "task" | "git" | <path to .diff>
+    sarif_source: str = ""          # "" | <path to .sarif>
+    changed_lines: Dict[str, List[int]] = field(default_factory=dict)
 
     # budgets / limits (with defaults)
     time_budget_s: int = 60
@@ -58,7 +61,10 @@ def _abs(root: str, rel: str) -> str:
     return os.path.normpath(os.path.join(root, rel))
 
 
-def load_task(path: str) -> Task:
+def load_task(path: str, diff_override: Optional[str] = None,
+              sarif_override: Optional[str] = None) -> Task:
+    """Load a task. `diff_override` / `sarif_override` (from the CLI) take
+    precedence over the task file's ``diff`` / ``sarif`` keys."""
     if not os.path.exists(path):
         # allow bare task name -> tasks/<name>.json
         cand = os.path.join(PROJECT_ROOT, "tasks", path)
@@ -73,6 +79,29 @@ def load_task(path: str) -> Task:
     root = _abs(PROJECT_ROOT, d["root"])
     budgets = d.get("budgets", {})
 
+    # ---- real-world signal ingestion (diff / SARIF) ----------------------
+    from . import ingest  # local import to avoid a cycle at module load
+    diff_changed = list(d.get("diff_changed", []))
+    changed_lines: Dict[str, List[int]] = {}
+    diff_src = diff_override or d.get("diff") or "task"
+    if diff_src == "git":
+        changed_lines = ingest.changed_files_from_git(root)
+    elif diff_src != "task":
+        dp = diff_src if os.path.isabs(diff_src) else _abs(root, diff_src)
+        if not os.path.exists(dp):
+            dp = _abs(PROJECT_ROOT, diff_src)
+        changed_lines = ingest.changed_files_from_diff_file(dp)
+    if changed_lines:
+        diff_changed = sorted(set(diff_changed) | set(changed_lines))
+
+    static_alerts = list(d.get("static_alerts", []))
+    sarif_src = sarif_override or d.get("sarif") or ""
+    if sarif_src:
+        sp = sarif_src if os.path.isabs(sarif_src) else _abs(root, sarif_src)
+        if not os.path.exists(sp):
+            sp = _abs(PROJECT_ROOT, sarif_src)
+        static_alerts += ingest.alerts_from_sarif(sp, root)
+
     return Task(
         name=d["name"],
         language=d.get("language", "c"),
@@ -83,11 +112,14 @@ def load_task(path: str) -> Task:
         test_sources=[_abs(root, s) for s in d.get("test_sources", [])],
         patch_scope=[_abs(root, s) for s in d.get("patch_scope", d["sources"])],
         magic=d.get("magic"),
-        diff_changed=d.get("diff_changed", []),
-        static_alerts=d.get("static_alerts", []),
+        diff_changed=diff_changed,
+        static_alerts=static_alerts,
         description=d.get("description", ""),
         seeds=[_abs(root, s) for s in d.get("seeds", [])],
         raw=d,
+        diff_source=diff_src,
+        sarif_source=sarif_src,
+        changed_lines=changed_lines,
         time_budget_s=int(budgets.get("time_budget_s", 60)),
         max_iters=int(budgets.get("max_iters", 200000)),
         rss_mb=int(budgets.get("rss_mb", 2048)),

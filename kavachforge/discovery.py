@@ -136,10 +136,19 @@ def _is_crash(r: "util.CmdResult") -> bool:
     return (not r.ok) and bool(_ASAN_START.search(blob) or _UBSAN.search(blob))
 
 
+def _asan_env(rss_mb: int) -> Dict[str, str]:
+    """Sanitizer options with a hard RSS cap (ASan reserves huge virtual
+    address space, so RLIMIT_AS cannot be used; hard_rss_limit_mb can)."""
+    return {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:exitcode=99:"
+                            "detect_stack_use_after_return=1:"
+                            "hard_rss_limit_mb=%d:allocator_may_return_null=1"
+                            % rss_mb}
+
+
 def _run_one(fuzzer_bin: str, path: str, rss_mb: int) -> "util.CmdResult":
-    env = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1:"
-                           "exitcode=99:detect_stack_use_after_return=1"}
-    return util.run([fuzzer_bin, path], env=env, timeout=20)
+    """Execute one input through the harness with memory/CPU/wall limits."""
+    return util.run([fuzzer_bin, path], env=_asan_env(rss_mb), timeout=20,
+                    cpu_seconds=15)
 
 
 # ---------------------------------------------------------------------------
@@ -185,44 +194,73 @@ def _mutate(rng: random.Random, data: bytes, corpus: List[bytes]) -> bytes:
 
 
 def run(task: "config.Task", tc: "toolchain.Toolchain", fuzzer_bin: str,
-        seeds: List[bytes], work_dir: str) -> Dict:
-    """Run discovery. Returns {crashes:[{input_path, asan_text}], stats:{...}}."""
+        seeds: List[bytes], work_dir: str, max_crashes: int = 8) -> Dict:
+    """Run discovery and keep collecting crashes past the first one (so the
+    verifier can demonstrate signature-level deduplication).
+
+    Returns {crashes:[{input_path, asan_text}], stats:{engine, seconds,
+    execs, corpus_seeds, first_crash_s, raw_crashes}}."""
     corpus_dir = os.path.join(work_dir, "corpus")
     crashes_dir = os.path.join(work_dir, "crashes")
     os.makedirs(crashes_dir, exist_ok=True)
     _write_corpus(corpus_dir, seeds, task.seeds)
 
     if tc.is_libfuzzer:
-        return _run_libfuzzer(task, fuzzer_bin, corpus_dir, crashes_dir)
-    return _run_standalone(task, fuzzer_bin, corpus_dir, crashes_dir, seeds)
+        return _run_libfuzzer(task, fuzzer_bin, corpus_dir, crashes_dir, max_crashes)
+    return _run_standalone(task, fuzzer_bin, corpus_dir, crashes_dir, seeds, max_crashes)
 
 
-def _run_libfuzzer(task, fuzzer_bin, corpus_dir, crashes_dir) -> Dict:
-    t0 = time.time()
-    env = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1"}
-    cmd = [fuzzer_bin, corpus_dir,
-           "-artifact_prefix=" + crashes_dir + os.sep,
-           "-max_total_time=%d" % task.time_budget_s,
-           "-rss_limit_mb=%d" % task.rss_mb,
-           "-timeout=20", "-print_final_stats=1"]
-    r = util.run(cmd, timeout=task.time_budget_s + 60, env=env)
-    blob = r.err + r.out
-    crashes = []
-    # libFuzzer writes crash-<sha1> into the artifact dir on a finding.
+def _collect_artifacts(crashes_dir: str, blob: str, limit: int) -> List[Dict]:
+    out = []
     for name in sorted(os.listdir(crashes_dir)):
         if name.startswith(("crash-", "oom-", "timeout-")):
-            crashes.append({"input_path": os.path.join(crashes_dir, name),
-                            "asan_text": blob})
+            out.append({"input_path": os.path.join(crashes_dir, name),
+                        "asan_text": blob})
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _run_libfuzzer(task, fuzzer_bin, corpus_dir, crashes_dir, max_crashes) -> Dict:
+    t0 = time.time()
+    env = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1"}
+    base = [fuzzer_bin, corpus_dir,
+            "-artifact_prefix=" + crashes_dir + os.sep,
+            "-rss_limit_mb=%d" % task.rss_mb, "-timeout=20",
+            "-print_final_stats=1"]
+
+    # Pass 1: single process until the first crash (gives time-to-first-PoV).
+    r = util.run(base + ["-max_total_time=%d" % task.time_budget_s],
+                 timeout=task.time_budget_s + 60, env=env)
+    first_s = round(time.time() - t0, 2)
+    blob = r.err + r.out
     execs = 0
     mm = re.search(r"stat::number_of_executed_units:\s*(\d+)", blob)
     if mm:
         execs = int(mm.group(1))
+    crashes = _collect_artifacts(crashes_dir, blob, max_crashes)
+
+    # Pass 2 (only if a crash was found): a short fork-mode run that ignores
+    # crashes keeps harvesting more artifacts so dedup has work to do.
+    if crashes:
+        extra = min(6, max(2, task.time_budget_s // 6))
+        r2 = util.run(base + ["-fork=1", "-ignore_crashes=1",
+                              "-max_total_time=%d" % extra],
+                      timeout=extra + 60, env=env)
+        mm2 = re.search(r"stat::number_of_executed_units:\s*(\d+)", r2.err + r2.out)
+        if mm2:
+            execs += int(mm2.group(1))
+        crashes = _collect_artifacts(crashes_dir, blob, max_crashes)
+
+    raw = len([n for n in os.listdir(crashes_dir) if n.startswith("crash-")])
     return {"crashes": crashes,
             "stats": {"engine": "libfuzzer", "seconds": round(time.time() - t0, 2),
-                      "execs": execs, "corpus_seeds": len(os.listdir(corpus_dir))}}
+                      "execs": execs, "corpus_seeds": len(os.listdir(corpus_dir)),
+                      "first_crash_s": first_s if crashes else None,
+                      "raw_crashes": raw}}
 
 
-def _run_standalone(task, fuzzer_bin, corpus_dir, crashes_dir, seeds) -> Dict:
+def _run_standalone(task, fuzzer_bin, corpus_dir, crashes_dir, seeds, max_crashes) -> Dict:
     t0 = time.time()
     rng = random.Random(task.rng_seed)
     corpus = list(seeds)
@@ -233,6 +271,9 @@ def _run_standalone(task, fuzzer_bin, corpus_dir, crashes_dir, seeds) -> Dict:
     cand_path = os.path.join(crashes_dir, "_candidate")
     execs = 0
     deadline = t0 + task.time_budget_s
+    crashes: List[Dict] = []
+    first_s = None
+    how = "standalone"
 
     def try_input(data: bytes):
         nonlocal execs
@@ -248,27 +289,87 @@ def _run_standalone(task, fuzzer_bin, corpus_dir, crashes_dir, seeds) -> Dict:
             return {"input_path": cp, "asan_text": res.err + res.out}
         return None
 
-    # 1) try seeds / provided corpus directly (LLM-reasoned inputs first)
+    # 1) seeds / provided corpus directly (structure-aware inputs first)
     for data in corpus:
         hit = try_input(data)
         if hit:
-            return _done(t0, execs, corpus, "standalone(seed)", [hit])
+            crashes.append(hit)
+            if first_s is None:
+                first_s, how = round(time.time() - t0, 2), "standalone(seed)"
+            if len(crashes) >= max_crashes:
+                break
 
-    # 2) mutational loop until a crash, the time budget, or max_iters
-    while execs < task.max_iters and time.time() < deadline:
+    # 2) mutational loop: continue after a crash to harvest more candidates,
+    #    but stop early once enough are collected or the budget is spent.
+    harvest_deadline = min(deadline, time.time() + 4) if crashes else deadline
+    while (execs < task.max_iters and time.time() < harvest_deadline
+           and len(crashes) < max_crashes):
         base = rng.choice(corpus)
         data = _mutate(rng, base, corpus)
         hit = try_input(data)
         if hit:
-            return _done(t0, execs, corpus, "standalone(mutation)", [hit])
-        # occasionally grow the corpus with longer inputs to help gates
-        if execs % 500 == 0:
+            crashes.append(hit)
+            if first_s is None:
+                first_s, how = round(time.time() - t0, 2), "standalone(mutation)"
+                harvest_deadline = min(deadline, time.time() + 4)
+        elif execs % 500 == 0:
             corpus.append(_mutate(rng, rng.choice(corpus), corpus))
 
-    return _done(t0, execs, corpus, "standalone", [])
-
-
-def _done(t0, execs, corpus, engine, crashes) -> Dict:
+    try:
+        os.remove(cand_path)
+    except OSError:
+        pass
     return {"crashes": crashes,
-            "stats": {"engine": engine, "seconds": round(time.time() - t0, 2),
-                      "execs": execs, "corpus_seeds": len(corpus)}}
+            "stats": {"engine": how, "seconds": round(time.time() - t0, 2),
+                      "execs": execs, "corpus_seeds": len(corpus),
+                      "first_crash_s": first_s, "raw_crashes": len(crashes)}}
+
+
+# ---------------------------------------------------------------------------
+# Seed uplift A/B (optional, measured honestly)
+# ---------------------------------------------------------------------------
+def measure_uplift(task: "config.Task", tc: "toolchain.Toolchain",
+                   fuzzer_bin: str, work_dir: str, budget_s: int = 20) -> Dict:
+    """Time-to-first-crash starting from an EMPTY corpus (no structure-aware
+    seeds), bounded by `budget_s`. Compared against the seeded run this
+    quantifies what the seed generator contributed for this engine."""
+    t0 = time.time()
+    udir = os.path.join(work_dir, "uplift")
+    cdir, adir = os.path.join(udir, "corpus"), os.path.join(udir, "crashes")
+    for d in (cdir, adir):
+        os.makedirs(d, exist_ok=True)
+    found = None
+    execs = 0
+    if tc.is_libfuzzer:
+        env = {"ASAN_OPTIONS": "detect_leaks=0:abort_on_error=1"}
+        r = util.run([fuzzer_bin, cdir, "-artifact_prefix=" + adir + os.sep,
+                      "-max_total_time=%d" % budget_s, "-print_final_stats=1",
+                      "-rss_limit_mb=%d" % task.rss_mb],
+                     timeout=budget_s + 60, env=env)
+        blob = r.err + r.out
+        mm = re.search(r"stat::number_of_executed_units:\s*(\d+)", blob)
+        execs = int(mm.group(1)) if mm else 0
+        if any(n.startswith("crash-") for n in os.listdir(adir)):
+            found = round(time.time() - t0, 2)
+    else:
+        rng = random.Random(task.rng_seed + 1)
+        corpus = [rng.randbytes(16), b"\x00" * 16, b"\xff" * 16]
+        cand = os.path.join(adir, "_c")
+        deadline = t0 + budget_s
+        while time.time() < deadline and execs < task.max_iters:
+            data = _mutate(rng, rng.choice(corpus), corpus)
+            with open(cand, "wb") as f:
+                f.write(data)
+            execs += 1
+            res = _run_one(fuzzer_bin, cand, task.rss_mb)
+            if _is_crash(res):
+                found = round(time.time() - t0, 2)
+                break
+            if execs % 300 == 0:
+                corpus.append(data)
+    return {"budget_s": budget_s, "execs": execs,
+            "first_crash_s": found,
+            "note": ("coverage-guided engine cracked the format gate unaided"
+                     if found is not None and tc.is_libfuzzer else
+                     "no crash without structure-aware seeds within budget"
+                     if found is None else "mutation found it unaided")}

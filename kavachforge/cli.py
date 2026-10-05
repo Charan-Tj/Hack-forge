@@ -1,10 +1,12 @@
 """KavachForge command-line interface.
 
-    kavach run <task>         full closed loop (LLM if a key is set, else offline)
-    kavach replay <task>      deterministic offline demo (no network, no key)
-    kavach demo               run all bundled targets (2 vulnerable + 1 control)
+    kavach showcase           serve the live dashboard AND run every target (judges)
+    kavach run <task>         full closed loop on one task
+    kavach replay [task]      deterministic offline run (no network, no key)
+    kavach demo               run all bundled targets
     kavach doctor             check the toolchain / environment
-    kavach serve [task]       serve the dashboard(s) over HTTP
+    kavach selftest           run the built-in unit tests
+    kavach serve              serve existing dashboards over HTTP
     kavach list               list bundled tasks
     kavach clean              remove generated artifacts
 """
@@ -14,61 +16,105 @@ import argparse
 import os
 import shutil
 import sys
+import threading
 
-from . import __version__, config, toolchain, util
+from . import __version__, config, report, toolchain, util
 from .pipeline import run_task
 
 TASKS = ["tinyimg", "recordcfg", "cleanjson"]
+ART = "artifacts"
 
 
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def _common_kwargs(args, provider=None):
+    return dict(provider=provider, model=getattr(args, "model", None),
+                budget=getattr(args, "budget", 6),
+                engine_pref=getattr(args, "engine", None),
+                keep_worktree=getattr(args, "keep", False),
+                uplift=getattr(args, "uplift", False),
+                diff=getattr(args, "diff", None),
+                sarif=getattr(args, "sarif", None))
+
+
+def _run_many(names, args, provider=None, on_each=None) -> int:
+    rc = 0
+    results = []
+    for n in names:
+        try:
+            r = run_task(n, **_common_kwargs(args, provider))
+            results.append((n, r["metrics"]))
+        except Exception as e:
+            util.bad("task %s failed: %s" % (n, e))
+            rc = 1
+        if on_each:
+            on_each()
+    if len(results) > 1:
+        util.stage("Summary")
+        for n, m in results:
+            util.info("%-12s raw=%-3d unique=%d verified=%d first_pov=%s"
+                      % (n, m.get("raw_crashes", 0), m["unique_findings"],
+                         m["verified_patches"], m["time_to_first_pov"]))
+    return rc
+
+
+def _start_server(port: int, root: str):
+    """Serve `root` on a background thread; returns the httpd."""
+    import http.server
+    import socketserver
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, directory=root, **kw)
+
+        def log_message(self, *a):
+            pass
+
+        def end_headers(self):
+            self.send_header("Cache-Control", "no-store")
+            super().end_headers()
+
+    socketserver.TCPServer.allow_reuse_address = True
+    httpd = socketserver.TCPServer(("0.0.0.0", port), Quiet)
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    return httpd
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
 def _cmd_doctor(args) -> int:
     util.stage("Environment check")
     ok = True
     py = sys.version_info
-    util.good("python %d.%d.%d" % (py.major, py.minor, py.micro))
-    for tool in ("patch",):
-        if shutil.which(tool):
-            util.good("%s found" % tool)
-        else:
-            util.bad("%s NOT found (required to apply patches)" % tool); ok = False
+    (util.good if py >= (3, 9) else util.bad)("python %d.%d.%d%s" % (
+        py.major, py.minor, py.micro, "" if py >= (3, 9) else "  (need 3.9+)"))
+    ok = ok and py >= (3, 9)
+    if shutil.which("patch"):
+        util.good("patch found")
+    else:
+        util.bad("patch NOT found (required to apply patches)"); ok = False
     try:
         tc = toolchain.detect(args.engine)
         util.good("toolchain: %s" % tc.note)
+        if not tc.is_libfuzzer:
+            util.info(util.dim("  (libFuzzer runtime not found: using the standalone "
+                               "engine; run with --docker for coverage-guided fuzzing)"))
     except RuntimeError as e:
         util.bad(str(e)); ok = False
     for cc in ("clang", "gcc"):
         util.info("  %s: %s" % (cc, shutil.which(cc) or "not found"))
     util.info("docker: %s" % (shutil.which("docker") or "not found (optional)"))
+    for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        if os.environ.get(k):
+            util.good("%s set (live model available)" % k)
+    if not any(os.environ.get(k) for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY")):
+        util.info(util.dim("no API key set: offline deterministic brain will be used"))
     print()
     (util.good if ok else util.bad)("doctor: %s" % ("READY" if ok else "ISSUES FOUND"))
     return 0 if ok else 1
-
-
-def _run_many(names, args, provider=None) -> int:
-    rc = 0
-    results = []
-    for n in names:
-        try:
-            r = run_task(n, provider=provider, model=args.model,
-                         budget=args.budget, engine_pref=args.engine,
-                         keep_worktree=args.keep)
-            results.append((n, r["metrics"]))
-        except Exception as e:
-            util.bad("task %s failed: %s" % (n, e))
-            rc = 1
-    if len(results) > 1:
-        util.stage("Summary")
-        for n, m in results:
-            util.info("%-12s findings=%d verified=%d first_pov=%s"
-                      % (n, m["unique_findings"], m["verified_patches"],
-                         m["time_to_first_pov"]))
-    if results:
-        util.info(util.dim("View a dashboard:  ./kavach serve"))
-    return rc
-
-
-def _cmd_run(args) -> int:
-    return _run_many([args.task], args)
 
 
 def _cmd_replay(args) -> int:
@@ -78,9 +124,57 @@ def _cmd_replay(args) -> int:
 
 
 def _cmd_demo(args) -> int:
-    os.environ.setdefault("KAVACH_LLM_PROVIDER",
-                          os.environ.get("KAVACH_LLM_PROVIDER", "offline"))
-    return _run_many(TASKS, args, provider=os.environ.get("KAVACH_LLM_PROVIDER"))
+    return _run_many(TASKS, args, provider=getattr(args, "provider", None))
+
+
+def _cmd_showcase(args) -> int:
+    """One command for the judges: dashboard first, then the run, live."""
+    os.makedirs(ART, exist_ok=True)
+    root = os.path.abspath(ART)
+    names = TASKS if args.task in (None, "all") else [args.task]
+    if args.fresh:
+        for n in names:
+            shutil.rmtree(os.path.join(root, n), ignore_errors=True)
+    util.write_json(os.path.join(root, ".showcase.json"), {"tasks": names})
+    report.write_index(root, names)
+    httpd = _start_server(args.port, root)
+    url = "http://localhost:%d/" % args.port
+    util.plain(util.bold("\nKavachForge showcase"))
+    util.good("live dashboard: %s" % util.blue(url))
+    util.info(util.dim("open it now; it updates as each stage completes"))
+    if args.provider:
+        os.environ["KAVACH_LLM_PROVIDER"] = args.provider
+
+    def refresh_index():
+        report.write_index(root, names)
+
+    rc = _run_many(names, args, provider=args.provider, on_each=refresh_index)
+    refresh_index()
+    util.plain("")
+    util.good("showcase complete — dashboard stays live at %s (Ctrl-C to stop)" % url)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print()
+    httpd.shutdown()
+    return rc
+
+
+def _cmd_serve(args) -> int:
+    root = os.path.abspath(ART)
+    if not os.path.isdir(root):
+        util.bad("no artifacts/ yet — run ./kavach showcase first")
+        return 1
+    present = [n for n in TASKS if os.path.isdir(os.path.join(root, n))]
+    util.write_json(os.path.join(root, ".showcase.json"), {"tasks": present or TASKS})
+    report.write_index(root, present or TASKS)
+    _start_server(args.port, root)
+    util.good("serving dashboards at http://localhost:%d/  (Ctrl-C to stop)" % args.port)
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print()
+    return 0
 
 
 def _cmd_list(args) -> int:
@@ -92,43 +186,22 @@ def _cmd_list(args) -> int:
 
 
 def _cmd_clean(args) -> int:
-    for d in ("artifacts",):
-        if os.path.isdir(d):
-            shutil.rmtree(d, ignore_errors=True)
-            util.good("removed %s/" % d)
+    if os.path.isdir(ART):
+        shutil.rmtree(ART, ignore_errors=True)
+        util.good("removed %s/" % ART)
     return 0
 
 
-def _serve(args) -> int:
-    import http.server
-    import socketserver
-    root = os.path.abspath("artifacts")
-    if not os.path.isdir(root):
-        util.bad("no artifacts/ yet — run ./kavach demo first")
-        return 1
-    # build an index listing each task dashboard
-    links = []
-    for name in sorted(os.listdir(root)):
-        dash = os.path.join(root, name, "dashboard.html")
-        if os.path.exists(dash):
-            links.append('<li><a href="%s/dashboard.html">%s</a></li>' % (name, name))
-    util.write_text(os.path.join(root, "index.html"),
-                    "<!doctype html><meta charset=utf-8><title>KavachForge</title>"
-                    "<body style='font-family:system-ui;background:#0b0f14;color:#e6edf3;padding:40px'>"
-                    "<h1 style='color:#4da3ff'>KavachForge dashboards</h1><ul style='font-size:18px'>"
-                    + "".join(links) + "</ul></body>")
-    os.chdir(root)
-    port = args.port
-    handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("0.0.0.0", port), handler) as httpd:
-        util.good("serving dashboards at http://localhost:%d/  (Ctrl-C to stop)" % port)
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            print()
-    return 0
+def _cmd_selftest(args) -> int:
+    import unittest
+    here = os.path.dirname(os.path.abspath(__file__))
+    suite = unittest.defaultTestLoader.discover(os.path.join(here, "tests"),
+                                                top_level_dir=os.path.dirname(here))
+    res = unittest.TextTestRunner(verbosity=2 if args.verbose else 1).run(suite)
+    return 0 if res.wasSuccessful() else 1
 
 
+# ---------------------------------------------------------------------------
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="kavach", description="KavachForge — evidence-gated "
@@ -136,20 +209,32 @@ def main(argv=None) -> int:
     p.add_argument("--version", action="version", version="KavachForge " + __version__)
     sub = p.add_subparsers(dest="cmd")
 
-    def common(sp):
+    def common(sp, with_provider=True):
         sp.add_argument("--model", default=None, help="LLM model id")
         sp.add_argument("--budget", type=int, default=6, help="max live LLM calls")
         sp.add_argument("--engine", choices=["libfuzzer", "standalone"], default=None)
         sp.add_argument("--keep", action="store_true", help="keep patch worktrees")
+        sp.add_argument("--uplift", action="store_true",
+                        help="also measure seed uplift (empty-corpus A/B)")
+        sp.add_argument("--diff", default=None,
+                        help="'git' or a .diff file to drive risk ranking")
+        sp.add_argument("--sarif", default=None, help="SARIF file of static alerts")
+        if with_provider:
+            sp.add_argument("--provider", default=None,
+                            help="anthropic|openai|ollama|offline")
+
+    sp = sub.add_parser("showcase", help="serve live dashboard + run all targets")
+    sp.add_argument("task", nargs="?", default="all")
+    sp.add_argument("--port", type=int, default=8777)
+    sp.add_argument("--fresh", action="store_true", help="clear previous artifacts first")
+    common(sp); sp.set_defaults(func=_cmd_showcase)
 
     sp = sub.add_parser("run", help="run the full loop on a task")
     sp.add_argument("task"); common(sp)
-    sp.add_argument("--provider", default=None,
-                    help="anthropic|openai|ollama|offline")
     sp.set_defaults(func=lambda a: _run_many([a.task], a, provider=a.provider))
 
-    sp = sub.add_parser("replay", help="deterministic offline demo (no network)")
-    sp.add_argument("task", nargs="?", default="all"); common(sp)
+    sp = sub.add_parser("replay", help="deterministic offline run (no network)")
+    sp.add_argument("task", nargs="?", default="all"); common(sp, with_provider=False)
     sp.set_defaults(func=_cmd_replay)
 
     sp = sub.add_parser("demo", help="run all bundled targets")
@@ -159,6 +244,10 @@ def main(argv=None) -> int:
     sp.add_argument("--engine", choices=["libfuzzer", "standalone"], default=None)
     sp.set_defaults(func=_cmd_doctor)
 
+    sp = sub.add_parser("selftest", help="run unit tests")
+    sp.add_argument("-v", "--verbose", action="store_true")
+    sp.set_defaults(func=_cmd_selftest)
+
     sp = sub.add_parser("list", help="list bundled tasks")
     sp.set_defaults(func=_cmd_list)
 
@@ -166,9 +255,8 @@ def main(argv=None) -> int:
     sp.set_defaults(func=_cmd_clean)
 
     sp = sub.add_parser("serve", help="serve dashboards over HTTP")
-    sp.add_argument("task", nargs="?", default=None)
     sp.add_argument("--port", type=int, default=8777)
-    sp.set_defaults(func=_serve)
+    sp.set_defaults(func=_cmd_serve)
 
     args = p.parse_args(argv)
     if not getattr(args, "cmd", None):

@@ -24,7 +24,9 @@ if [[ "${1:-}" == "--docker" ]]; then
   for v in ANTHROPIC_API_KEY OPENAI_API_KEY KAVACH_LLM_PROVIDER KAVACH_LLM_MODEL KAVACH_LLM_BUDGET; do
     [[ -n "${!v:-}" ]] && ENVARGS+=("-e" "$v=${!v}")
   done
-  exec docker run --rm -it \
+  TTY="-i"; [[ -t 0 && -t 1 ]] && TTY="-it"
+  mkdir -p artifacts cache
+  exec docker run --rm $TTY \
     -v "$PWD/artifacts:/app/artifacts" \
     -v "$PWD/cache:/app/cache" \
     -p 8777:8777 \

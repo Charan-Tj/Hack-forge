@@ -44,12 +44,16 @@ Fallback if anything is flaky: `./kavach replay` (offline, deterministic).
 - **Honest** — a control target proves no-false-positive behavior; rejected patches
   are shown as rejected.
 
-## Metrics we hit (from one `demo` run)
-- 2 unique, reproducible crashes (distinct normalized stack signatures)
-- time-to-first-PoV: seconds
-- ≥1 (here 2) verified minimal patches
-- 0 unverified alerts reported
-- 100% audit trail; LLM calls within budget (≤6/target)
+## Metrics we hit (from one `showcase` run, libFuzzer engine)
+- 2 unique, reproducible crashes — **~45 raw crashes each collapsed to 1 finding** by
+  normalized stack signature (distinct signatures across targets)
+- time-to-first-PoV: ~0.1 s per target
+- 2 verified minimal patches (apply + build + PoV blocked + tests pass)
+- control target: **10M+ coverage-guided execs, 0 findings** (no false positive)
+- 0 unverified alerts reported; 100% audit trail (evidence.json, manifest.json, run.log,
+  llm_log/); LLM calls within budget (≤6/target); 23/23 self-tests
+- resilience exercised: live model → cached rerun (0 calls) → model endpoint dead
+  (still Verified from cache) → no cache/no model (still Verified, offline brain)
 
 ## Scope & honesty (pre-empt the hard question)
 - Target class for the finale: Docker-buildable C/C++ with a libFuzzer harness.

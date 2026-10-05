@@ -222,6 +222,15 @@ def _source_slice(task: "config.Task", finding: "verifier.Finding") -> str:
     return util.read_text(path)
 
 
+def _normalize_report(text: str) -> str:
+    """Strip run-specific noise (PIDs, addresses, absolute paths) so identical
+    bugs produce identical prompts -> stable cache keys across runs."""
+    text = re.sub(r"==\d+==", "==PID==", text)
+    text = re.sub(r"0x[0-9a-fA-F]{4,}", "0xADDR", text)
+    text = re.sub(r"(/[\w.\-]+)+/(?=[\w.\-]+\.(?:c|h|cc|cpp|inc):\d+)", "", text)
+    return text
+
+
 def _prompt(task, finding, rel, prior_reason: Optional[str]) -> str:
     src = _source_slice(task, finding)
     reflect = ""
@@ -240,7 +249,8 @@ def _prompt(task, finding, rel, prior_reason: Optional[str]) -> str:
         "Respond with ONLY a unified diff using headers exactly 'a/%s' and "
         "'b/%s' (git-style, 3 lines of context)."
         % (finding.cwe_name, finding.cwe, finding.crash_file, finding.crash_func,
-           finding.access, finding.asan_report, rel, src, rel, reflect, rel, rel))
+           finding.access, _normalize_report(finding.asan_report), rel, src, rel,
+           reflect, rel, rel))
 
 
 def _extract_diff(text: str) -> str:

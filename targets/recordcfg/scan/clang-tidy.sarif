@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "clang-tidy",
+          "version": "18.1.3",
+          "rules": [
+            {
+              "id": "clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling",
+              "shortDescription": {"text": "Call to function 'memcpy' is insecure; length is not validated against destination size"}
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling",
+          "level": "warning",
+          "message": {"text": "memcpy into fixed-size field 'value' with unvalidated length 'rec->length'"},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {"uri": "src/recordcfg.c"},
+                "region": {"startLine": 54, "startColumn": 9}
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
