@@ -51,6 +51,7 @@ class Task:
     changed_lines: Dict[str, List[int]] = field(default_factory=dict)
     probe: Optional[str] = None     # absolute path to behaviour probe main, optional
     seed_generator: Optional[str] = None  # absolute path to a seed-generator program, optional
+    link_flags: List[str] = field(default_factory=list)  # extra linker flags, e.g. ['-lm']
 
     # budgets / limits (with defaults)
     time_budget_s: int = 60
@@ -127,6 +128,7 @@ def load_task(path: str, diff_override: Optional[str] = None,
         changed_lines=changed_lines,
         probe=(_abs(root, d["probe"]) if d.get("probe") else None),
         seed_generator=(_abs(root, d["seed_generator"]) if d.get("seed_generator") else None),
+        link_flags=list(d.get("link_flags", [])),
         time_budget_s=int(budgets.get("time_budget_s", 60)),
         max_iters=int(budgets.get("max_iters", 200000)),
         rss_mb=int(budgets.get("rss_mb", 2048)),

@@ -89,7 +89,7 @@ def _build_and_run(task, tc, tree_root: str, test_src: str, out_bin: str):
     srcs = [remap(s) for s in task.sources]
     harness = remap(task.harness)
     incs = [remap(i) for i in task.include_dirs]
-    cmd = toolchain.build_test_cmd(tc, srcs + [harness, test_src], incs, out_bin)
+    cmd = toolchain.build_test_cmd(tc, srcs + [harness, test_src], incs, out_bin, link_flags=task.link_flags)
     b = util.run(cmd, timeout=120)
     if not b.ok:
         return None, "build failed: " + b.err[-200:]

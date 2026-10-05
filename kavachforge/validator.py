@@ -102,7 +102,7 @@ def validate(task: "config.Task", tc: "toolchain.Toolchain", finding,
         harness = _remap(task, dst, task.harness)
         incs = [_remap(task, dst, i) for i in task.include_dirs]
         out_bin = os.path.join(worktree, "fuzzer_patched")
-        cmd = toolchain.build_fuzzer_cmd(tc, srcs, harness, incs, out_bin)
+        cmd = toolchain.build_fuzzer_cmd(tc, srcs, harness, incs, out_bin, link_flags=task.link_flags)
         bld = util.run(cmd, timeout=180)
         ok_build = bld.ok and os.path.exists(out_bin)
         gates.append(Gate("G1 rebuild", ok_build, bld.err[-300:] if not ok_build else "clean build"))

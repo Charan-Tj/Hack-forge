@@ -32,7 +32,8 @@ def build_fuzzer(task: "config.Task", tc: "toolchain.Toolchain", out_dir: str) -
     os.makedirs(out_dir, exist_ok=True)
     out_bin = os.path.join(out_dir, "fuzzer")
     cmd = toolchain.build_fuzzer_cmd(tc, task.sources, task.harness,
-                                     task.include_dirs, out_bin)
+                                     task.include_dirs, out_bin,
+                                     link_flags=task.link_flags)
     r = util.run(cmd, timeout=180)
     if not r.ok or not os.path.exists(out_bin):
         raise BuildError(" ".join(cmd) + "\n\n" + r.err + r.out)

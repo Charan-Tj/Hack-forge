@@ -49,7 +49,7 @@ def _build_probe(task, tc, tree_root: str, out_bin: str) -> Optional[str]:
     srcs = [_remap(task, tree_root, s) for s in task.sources]
     probe = _remap(task, tree_root, task.probe)
     incs = [_remap(task, tree_root, i) for i in task.include_dirs]
-    r = util.run(toolchain.build_test_cmd(tc, srcs + [probe], incs, out_bin), timeout=120)
+    r = util.run(toolchain.build_test_cmd(tc, srcs + [probe], incs, out_bin, link_flags=task.link_flags), timeout=120)
     return out_bin if r.ok and os.path.exists(out_bin) else None
 
 

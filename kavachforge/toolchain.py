@@ -84,6 +84,34 @@ def _can_compile(cc: str, extra: List[str]) -> bool:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _probe_coverage(cc: str) -> str:
+    """Return a working SanitizerCoverage flag for `cc`, or "". The probe
+    links a stub harness WITH the standalone driver (which defines the
+    __sanitizer_cov_* callbacks) + the cov flag — exactly how the real
+    discovery binary is built — so detection reflects reality, not a bare
+    program that is missing the callback symbols (gcc uses trace-pc, clang
+    trace-pc-guard)."""
+    tmp = tempfile.mkdtemp(prefix="kv_cov_")
+    try:
+        stub = os.path.join(tmp, "h.c")
+        out = os.path.join(tmp, "h")
+        util.write_text(stub, "#include <stddef.h>\n#include <stdint.h>\n"
+                              "int LLVMFuzzerTestOneInput(const uint8_t*d,size_t n)"
+                              "{(void)d;(void)n;return 0;}\n")
+        for flag in ("-fsanitize-coverage=trace-pc-guard", "-fsanitize-coverage=trace-pc"):
+            r = util.run([cc] + BASE_FLAGS + ["-fsanitize=address", flag,
+                          stub, STANDALONE_MAIN, "-o", out])
+            if r.ok and os.path.exists(out):
+                return flag
+            try:
+                os.remove(out)
+            except OSError:
+                pass
+        return ""
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def detect(prefer: Optional[str] = None) -> Toolchain:
     """Pick the best available engine. `prefer` can force 'libfuzzer' or
     'standalone'; falls through if the forced choice is unavailable."""
@@ -101,11 +129,7 @@ def detect(prefer: Optional[str] = None) -> Toolchain:
 
     for cc in ("clang", "gcc", "cc"):
         if _can_compile(cc, ["-fsanitize=address"]):
-            cov = ""
-            for flag in ("-fsanitize-coverage=trace-pc-guard", "-fsanitize-coverage=trace-pc"):
-                if _can_compile(cc, ["-fsanitize=address", flag]):
-                    cov = flag
-                    break
+            cov = _probe_coverage(cc)
             note = ("%s + AddressSanitizer (standalone, %s)"
                     % (cc, "coverage-guided" if cov else "blind mutational"))
             return Toolchain("standalone", cc, note, cov)
@@ -116,7 +140,8 @@ def detect(prefer: Optional[str] = None) -> Toolchain:
 
 
 def build_fuzzer_cmd(tc: Toolchain, sources: List[str], harness: str,
-                     include_dirs: List[str], out_bin: str) -> List[str]:
+                     include_dirs: List[str], out_bin: str,
+                     link_flags: Optional[List[str]] = None) -> List[str]:
     """Command that produces the discovery binary `out_bin`."""
     inc = []
     for d in include_dirs:
@@ -128,14 +153,15 @@ def build_fuzzer_cmd(tc: Toolchain, sources: List[str], harness: str,
         san = ["-fsanitize=address"] + ([tc.cov_flag] if tc.cov_flag else [])
         extra_src = [STANDALONE_MAIN]
     return [tc.cc] + BASE_FLAGS + san + inc + sources + [harness] + extra_src + \
-           ["-o", out_bin]
+           ["-o", out_bin] + list(link_flags or [])
 
 
 def build_test_cmd(tc: Toolchain, test_sources: List[str],
-                   include_dirs: List[str], out_bin: str) -> List[str]:
+                   include_dirs: List[str], out_bin: str,
+                   link_flags: Optional[List[str]] = None) -> List[str]:
     """Command that builds the regression-test binary (ASan only, no fuzzer)."""
     inc = []
     for d in include_dirs:
         inc += ["-I", d]
     return [tc.cc] + BASE_FLAGS + ["-fsanitize=address"] + inc + test_sources + \
-           ["-o", out_bin]
+           ["-o", out_bin] + list(link_flags or [])
