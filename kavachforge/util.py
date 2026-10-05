@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -127,6 +128,7 @@ def run(cmd, cwd=None, env=None, timeout=None, input_bytes=None,
         cpu_seconds=None) -> CmdResult:
     """Run a command (list or str). Never raises on non-zero exit.
     `cpu_seconds` caps CPU time of the child (sandboxing untrusted inputs)."""
+    cmd = resolve_command(cmd)
     shell = isinstance(cmd, str)
     full_env = dict(os.environ)
     if env:
@@ -180,14 +182,26 @@ def write_json(path: str, obj) -> None:
 
 
 def read_text(path: str) -> str:
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
         return f.read()
 
 
 def write_text(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w", encoding="utf-8", newline="") as f:
         f.write(text)
+
+
+def resolve_command(cmd):
+    """Resolve Windows command shims such as npm.cmd before execution."""
+    if not isinstance(cmd, (list, tuple)) or not cmd:
+        return cmd
+    name = os.path.basename(str(cmd[0])).lower()
+    if name in {"npm", "npm.cmd", "npx", "npx.cmd", "yarn", "yarn.cmd"}:
+        resolved = shutil.which(str(cmd[0]))
+        if resolved:
+            return [resolved] + list(cmd[1:])
+    return cmd
 
 
 def hexdump(b: bytes, limit: int = 256) -> str:

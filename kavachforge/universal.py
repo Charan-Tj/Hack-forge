@@ -42,8 +42,12 @@ import subprocess
 import sys
 import tempfile
 import time
+from html.parser import HTMLParser
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
 
 from . import config, cwe as cwemod, llm, util
 
@@ -99,7 +103,7 @@ def source_files(root: str, limit: int = 4000) -> List[str]:
         dns[:] = sorted(d for d in dns if d not in SKIP_DIRS and not d.startswith("."))
         for f in sorted(fns):
             if os.path.splitext(f)[1] in EXT_LANG and not f.endswith(".min.js"):
-                out.append(os.path.relpath(os.path.join(dp, f), root))
+                out.append(os.path.relpath(os.path.join(dp, f), root).replace(os.sep, "/"))
                 if len(out) >= limit:
                     return out
     return out
@@ -126,6 +130,12 @@ class SFinding:
     critical: bool = False
     signature: str = ""
     duplicates: int = 0
+    model_calls: int = 0
+
+
+def _root_path(root: str, rel: str) -> str:
+    """Join a repository-relative, forward-slash path on the host OS."""
+    return os.path.join(root, *rel.replace("\\", "/").split("/"))
 
 
 _CWE_NAMES = {"CWE-78": "OS Command Injection", "CWE-79": "Cross-site Scripting", "CWE-89": "SQL Injection",
@@ -273,7 +283,8 @@ def findings_from_sarif(root: str, sarif: dict, prefix: str) -> List[SFinding]:
             # skip vendored / minified / test fixtures
             if any(part in SKIP_DIRS for part in fpath.split("/")):
                 continue
-            ap = os.path.join(root, fpath)
+            fpath = fpath.replace("\\", "/")
+            ap = _root_path(root, fpath)
             if not os.path.exists(ap):
                 continue
             lines = util.read_text(ap).splitlines()
@@ -356,7 +367,7 @@ def run_builtin(root: str, files: List[str]) -> List[SFinding]:
         if not lang or lang in ("yaml", "json"):
             continue
         try:
-            text = util.read_text(os.path.join(root, rel))
+            text = util.read_text(_root_path(root, rel))
         except Exception:
             continue
         lines = text.splitlines()
@@ -412,8 +423,11 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
         merged.append(f)
     def _rank(f: SFinding):
         lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
-        code = 0 if lang not in ("", "yaml", "json") else 1      # code before config/CI
-        return (code, -cwemod.severity_rank(f.severity), f.file, f.line)
+        parts = f.file.lower().split("/")
+        base = parts[-1]
+        low_signal = (parts[0] in {"config", "test", "tests", "spec"} or
+                      base.endswith(".config.js") or lang in ("yaml", "json"))
+        return (1 if low_signal else 0, -cwemod.severity_rank(f.severity), f.file, f.line)
     return sorted(merged, key=_rank), note
 
 
@@ -433,6 +447,7 @@ class Candidate:
 
 def _unified(rel: str, before: str, after: str) -> str:
     import difflib
+    rel = rel.replace(os.sep, "/")
     return "".join(difflib.unified_diff(before.splitlines(keepends=True), after.splitlines(keepends=True),
                                         fromfile="a/" + rel, tofile="b/" + rel, n=3))
 
@@ -441,7 +456,7 @@ def mechanical_fix(root: str, f: SFinding) -> Optional[Candidate]:
     lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
     for langs, pat, cwe_id, name, sev, msg, fix in BUILTIN_RULES:
         if lang in langs and cwe_id == f.cwe and fix:
-            text = util.read_text(os.path.join(root, f.file))
+            text = util.read_text(_root_path(root, f.file))
             lines = text.splitlines(keepends=True)
             i = f.line - 1
             if 0 <= i < len(lines) and re.search(fix[0], lines[i]):
@@ -465,8 +480,14 @@ def check_policy(f: SFinding, diff: str) -> Optional[str]:
     if removed and not added:
         return "patch only deletes code; a fix must validate, encode or replace the unsafe call"
     joined = "\n".join(added)
-    if re.search(r"\beval\s*\(|child_process|os\.system|shell\s*=\s*True|\$where", joined):
-        return "patch introduces a new dangerous primitive"
+    if re.search(r"\beval\s*\(|\bnew\s+Function\s*\(|child_process|os\.system|shell\s*=\s*True|\$where", joined):
+        return "patch introduces a new dangerous code or command execution primitive"
+    if re.search(r"\b(?:app|router|express)\s*\.\s*(?:get|post|put|delete|use)\s*\(\s*['\"`]", joined):
+        return "patch adds a new HTTP route"
+    if re.search(r"(?:http\s*\.\s*request|https\s*\.\s*request|\bfetch\s*\(|\baxios\s*\.)", joined):
+        return "patch adds an outbound network call"
+    if re.search(r"(?:createUser|create_user|insertOne|insertMany|users?\s*\.\s*(?:create|insert)|role\s*[:=]\s*['\"]admin)", joined, re.I):
+        return "patch creates users or grants an admin account"
     if re.search(r"(?i)todo|fixme|xxx", joined):
         return "patch contains placeholder text"
     return None
@@ -517,6 +538,12 @@ def _strip_line_numbers(text: str) -> str:
     return text
 
 
+def _preserve_line_endings(original: str, text: str) -> str:
+    ending = "\r\n" if "\r\n" in original else ("\r" if "\r" in original and "\n" not in original else "\n")
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized.replace("\n", ending)
+
+
 def _apply_search_replace(original: str, blocks: List[Tuple[str, str]]) -> Optional[str]:
     """Apply SEARCH/REPLACE blocks; exact match first, then an
     indentation-insensitive match (small models drift on leading spaces)."""
@@ -545,14 +572,14 @@ def _apply_search_replace(original: str, blocks: List[Tuple[str, str]]) -> Optio
         base = re.match(r"\s*", rep_lines[0]).group(0) if rep_lines else ""
         rep = [indent + (l[len(base):] if l.startswith(base) else l.lstrip()) if l.strip() else "" for l in rep_lines]
         src_lines[hit:hit + len(s_lines)] = rep
-        text = "\n".join(src_lines) + ("\n" if original.endswith("\n") else "")
-    return text
+        text = "\n".join(src_lines) + ("\n" if original.endswith(("\n", "\r")) else "")
+    return _preserve_line_endings(original, text)
 
 
 def candidate_from_text(root: str, f: SFinding, name: str, body: str) -> Optional[Candidate]:
     """Turn whatever a model produced - SEARCH/REPLACE blocks, a unified
     diff, or a whole file - into a unified diff we can gate."""
-    original = util.read_text(os.path.join(root, f.file))
+    original = util.read_text(_root_path(root, f.file))
     blocks = _SR_RE.findall(body)
     if blocks:
         new = _apply_search_replace(original, blocks)
@@ -567,16 +594,18 @@ def candidate_from_text(root: str, f: SFinding, name: str, body: str) -> Optiona
     # whole-file replacement (small models often answer this way)
     code = _strip_line_numbers(code)
     if code.count("\n") >= 0.5 * original.count("\n") and code.strip() != original.strip():
-        return Candidate(name, _unified(f.file, original, code if code.endswith("\n") else code + "\n"),
+        code = code if code.endswith(("\n", "\r")) else code + "\n"
+        return Candidate(name, _unified(f.file, original, _preserve_line_endings(original, code)),
                          "model", "Model-written fix (%s; whole-file answer normalised)." % name)
     return None
 
 
 def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
-                     prior_reason: Optional[str] = None) -> List[Candidate]:
+                     prior_reason: Optional[str] = None, strict: bool = False,
+                     raw_log_dir: Optional[str] = None, call_no: int = 1) -> List[Candidate]:
     if client is None:
         return []
-    text = util.read_text(os.path.join(root, f.file))
+    text = util.read_text(_root_path(root, f.file))
     lines = text.splitlines()
     lo, hi = max(0, f.line - 45), min(len(lines), f.end_line + 45)
     excerpt = "\n".join("%5d  %s" % (i + 1, lines[i]) for i in range(lo, hi))
@@ -586,11 +615,20 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
                                   file=f.file, line=f.line, end_line=f.end_line, excerpt=excerpt)
     if prior_reason:
         prompt += "\nA previous attempt was rejected because: %s. Avoid that.\n" % prior_reason
+    if strict:
+        prompt += ("\nSTRICT FORMAT RETRY: return exactly one SEARCH/REPLACE block using this concrete shape; "
+                   "copy the existing line exactly and do not return a unified diff or prose:\n"
+                   "<<<<<<< SEARCH\nold code exactly as shown\n=======\nnew code\n>>>>>>> REPLACE\n")
     try:
         resp = client.complete(prompt, system="You are a careful application-security engineer. "
                                               "You answer only in the requested edit format.", max_tokens=1800)
     except llm.LLMUnavailable:
         return []
+    if raw_log_dir:
+        os.makedirs(raw_log_dir, exist_ok=True)
+        raw_path = os.path.join(raw_log_dir, "%s-model-response-%d.txt" % (f.id, call_no))
+    else:
+        raw_path = ""
     parts = re.split(r"^###\s*STRATEGY:\s*(.+?)\s*$", resp, flags=re.MULTILINE)
     chunks: List[Tuple[str, str]] = []
     if len(parts) >= 3:
@@ -603,6 +641,8 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
         c = candidate_from_text(root, f, name, body)
         if c:
             out.append(c)
+    if not out and raw_path:
+        util.write_text(raw_path, resp)
     return out[:3]
 
 
@@ -633,29 +673,147 @@ INSTALLERS = {
 def install_deps(root: str, stacks: List[str], log=lambda m: None, timeout: int = 420) -> str:
     for s in stacks:
         cmd = INSTALLERS.get(s)
-        if not cmd or shutil.which(cmd[0].split("/")[-1]) is None and not os.path.exists(cmd[0]):
+        if not cmd:
             continue
         if s == "python" and not os.path.exists(os.path.join(root, "requirements.txt")):
             continue
         if s == "node" and os.path.isdir(os.path.join(root, "node_modules")):
             return "node dependencies already installed"
+        if s == "node":
+            resolved = shutil.which(cmd[0])
+            if not resolved:
+                return "not runnable here: npm not on PATH"
+            cmd = [resolved] + cmd[1:]
+        elif shutil.which(cmd[0]) is None and not os.path.exists(cmd[0]):
+            continue
         log("installing %s dependencies (%s) ..." % (s, " ".join(cmd[:2])))
-        r = util.run(cmd, cwd=root, timeout=timeout)
+        r = util.run(util.resolve_command(cmd), cwd=root, timeout=timeout)
         return "%s deps: %s" % (s, "installed" if r.ok else "install failed: " +
                                  (r.err.strip().splitlines() or ["?"])[-1][-120:])
     return "no installer for %s" % ", ".join(stacks)
 
 
+def _diff_path(header: str) -> str:
+    token = header[4:].split("\t", 1)[0].strip()
+    token = token.replace("\\", "/")
+    if token in ("/dev/null", "dev/null"):
+        return token
+    if token.startswith("a/") or token.startswith("b/"):
+        token = token[2:]
+    drive = re.match(r"^[A-Za-z]:", token)
+    parts = [p for p in token.split("/") if p not in ("", ".")]
+    if token.startswith("/") or drive or ".." in parts:
+        raise ValueError("unsafe patch path: %s" % token)
+    if not parts:
+        raise ValueError("empty patch path")
+    return "/".join(parts)
+
+
+def _parse_hunks(diff: str) -> List[Tuple[str, str, List[Tuple[int, int, List[str]]]]]:
+    lines = diff.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    files = []
+    i = 0
+    while i < len(lines):
+        if not lines[i].startswith("--- "):
+            i += 1
+            continue
+        old_path = _diff_path(lines[i])
+        i += 1
+        if i >= len(lines) or not lines[i].startswith("+++ "):
+            raise ValueError("unified diff is missing its +++ header")
+        new_path = _diff_path(lines[i])
+        i += 1
+        hunks = []
+        while i < len(lines) and not lines[i].startswith("--- "):
+            if not lines[i].startswith("@@ "):
+                i += 1
+                continue
+            match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", lines[i])
+            if not match:
+                raise ValueError("invalid hunk header: %s" % lines[i])
+            old_start = int(match.group(1)); old_count = int(match.group(2) or "1")
+            i += 1
+            body = []
+            while i < len(lines) and not lines[i].startswith("@@ ") and not lines[i].startswith("--- "):
+                if lines[i] != r"\ No newline at end of file":
+                    if not lines[i] or lines[i][0] not in " +-":
+                        raise ValueError("invalid hunk line: %s" % lines[i])
+                    body.append(lines[i])
+                i += 1
+            hunks.append((old_start, old_count, body))
+        if not hunks:
+            raise ValueError("unified diff has no hunks for %s" % new_path)
+        files.append((old_path, new_path, hunks))
+    if not files:
+        raise ValueError("not a unified diff")
+    return files
+
+
+def _apply_unified_python(tree: str, diff: str) -> None:
+    """Apply a small unified diff without relying on platform patch tools."""
+    for old_path, new_path, hunks in _parse_hunks(diff):
+        if old_path != "/dev/null" and new_path != "/dev/null" and old_path != new_path:
+            raise ValueError("source and destination paths differ: %s != %s" % (old_path, new_path))
+        rel = new_path if new_path != "/dev/null" else old_path
+        target = _root_path(tree, rel)
+        tree_root = os.path.realpath(tree)
+        if os.path.commonpath((tree_root, os.path.realpath(target))) != tree_root:
+            raise ValueError("patch path escapes scratch tree: %s" % rel)
+        exists = os.path.exists(target)
+        original = util.read_text(target) if exists else ""
+        normalized = original.replace("\r\n", "\n").replace("\r", "\n")
+        old_lines = normalized.splitlines()
+        new_lines = list(old_lines)
+        offset = 0
+        for old_start, old_count, body in hunks:
+            pos = max(0, old_start - 1) + offset
+            consumed = 0
+            replacement = []
+            for line in body:
+                marker, value = line[0], line[1:]
+                if marker in " -":
+                    if pos + consumed >= len(new_lines) or new_lines[pos + consumed] != value:
+                        raise ValueError("hunk does not match %s near line %d" % (rel, old_start))
+                    consumed += 1
+                if marker in " +":
+                    replacement.append(value)
+            if consumed != old_count:
+                raise ValueError("hunk line count does not match %s" % rel)
+            new_lines[pos:pos + consumed] = replacement
+            offset += len(replacement) - consumed
+        if exists and "\r\n" in original:
+            ending = "\r\n"
+        elif exists and "\r" in original and "\n" not in original:
+            ending = "\r"
+        else:
+            ending = "\n"
+        trailing = normalized.endswith("\n") or normalized.endswith("\r")
+        result = ending.join(new_lines) + (ending if trailing or (not exists and new_lines) else "")
+        util.write_text(target, result)
+
+
 def g0_apply(tree: str, diff: str) -> Tuple[bool, str]:
     tree = os.path.abspath(tree)
-    pf = os.path.join(tree, ".kv_patch.diff")
-    util.write_text(pf, diff)
-    r = util.run(["patch", "-p1", "-f", "-i", pf], cwd=tree, timeout=60)
     try:
-        os.remove(pf)
-    except OSError:
-        pass
-    return r.ok, (r.out.strip().splitlines() or r.err.strip().splitlines() or ["applied"])[-1][-200:]
+        _parse_hunks(diff)  # validate paths before an external tool can write
+    except ValueError as e:
+        return False, "python applier rejected diff: %s" % e
+    patch = shutil.which("patch")
+    if patch:
+        pf = os.path.join(tree, ".kv_patch.diff")
+        util.write_text(pf, diff)
+        r = util.run([patch, "-p1", "-f", "-i", pf], cwd=tree, timeout=60)
+        try:
+            os.remove(pf)
+        except OSError:
+            pass
+        detail = (r.out.strip().splitlines() or r.err.strip().splitlines() or ["applied"])[-1][-200:]
+        return r.ok, "external patch: " + detail
+    try:
+        _apply_unified_python(tree, diff)
+        return True, "python applier: applied"
+    except (OSError, ValueError) as e:
+        return False, "python applier: %s" % e
 
 
 SYNTAX_CHECK = {
@@ -674,7 +832,7 @@ def g1_syntax(tree: str, rel: str) -> Tuple[bool, str]:
     mk = SYNTAX_CHECK.get(lang)
     if not mk:
         return True, "no syntax checker for %s here (not checked)" % (lang or "this file type")
-    cmd = mk(os.path.join(tree, rel))
+    cmd = mk(_root_path(tree, rel))
     if shutil.which(cmd[0]) is None:
         return True, "%s not installed (not checked)" % cmd[0]
     r = util.run(cmd, cwd=tree, timeout=60)
@@ -714,7 +872,12 @@ def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optiona
         if s not in TEST_RUNNERS:
             continue
         tool, cmd, needs = TEST_RUNNERS[s]
-        if shutil.which(cmd[0]) is None:
+        resolved = shutil.which(cmd[0])
+        if s == "node" and not resolved:
+            return None, "not runnable here: npm not on PATH"
+        if resolved:
+            cmd = [resolved] + cmd[1:]
+        elif shutil.which(cmd[0]) is None:
             return None, "%s not installed" % tool
         if needs and not os.path.isdir(os.path.join(tree, needs)):
             return None, "%s dependencies not installed (%s/ missing) - suite cannot run offline" % (s, needs)
@@ -726,7 +889,7 @@ def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optiona
             except Exception:
                 return None, "package.json unreadable"
         env = {"CI": "1", "NODE_ENV": "test"}
-        r = util.run(cmd, cwd=tree, env=env, timeout=timeout)
+        r = util.run(util.resolve_command(cmd), cwd=tree, env=env, timeout=timeout)
         blob = r.out + r.err
         tail = (r.out.strip().splitlines() or r.err.strip().splitlines() or ["(no output)"])[-1][-160:]
         if r.code == 124:
@@ -736,6 +899,157 @@ def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optiona
             return None, "suite cannot run here: " + tail
         return r.ok, tail
     return None, "no recognised test runner for %s" % ", ".join(stacks)
+
+
+# ---------------------------------------------------------------------------
+# optional web-app behaviour gate (G5)
+# ---------------------------------------------------------------------------
+class HttpProbeError(RuntimeError):
+    pass
+
+
+class _CsrfParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.token = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() != "input":
+            return
+        values = dict(attrs)
+        if values.get("name", "").lower() in ("_csrf", "csrf", "csrf_token"):
+            self.token = values.get("value", "")
+
+
+class _HttpLimiter:
+    def __init__(self, rate: float):
+        if rate <= 0:
+            raise HttpProbeError("HTTP rate_limit must be greater than zero")
+        self.interval = 1.0 / rate
+        self.next_at = 0.0
+
+    def wait(self):
+        now = time.monotonic()
+        if self.next_at > now:
+            time.sleep(self.next_at - now)
+        self.next_at = time.monotonic() + self.interval
+
+
+def _allowed_target(url: str, allowed: List[str]) -> bool:
+    parsed = urlparse.urlparse(url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    actual = "%s:%d" % (host, port)
+    for target in allowed:
+        raw = str(target)
+        candidate = urlparse.urlparse(raw if "://" in raw else "//" + raw)
+        candidate_port = candidate.port or (443 if candidate.scheme == "https" else 80)
+        if candidate.hostname == host and candidate_port == port:
+            return True
+    return False
+
+
+def _probe_url(task, path: str) -> str:
+    cfg = task.raw.get("http_probe", {})
+    base = str(cfg.get("base_url", "")).rstrip("/")
+    return urlparse.urljoin(base + "/", str(path).lstrip("/"))
+
+
+def _normalise_http_body(body: str) -> str:
+    body = re.sub(r"(?is)(name\s*=\s*[\"']?(?:_csrf|csrf|csrf_token)[\"']?[^>]*value\s*=\s*[\"'])[^\"']*", r"\1<csrf>", body)
+    body = re.sub(r"(?i)(csrf(?:[_-]?token)?\s*[:=]\s*[\"']?)[^\"'\s,;}]+", r"\1<csrf>", body)
+    body = re.sub(r"(?i)(?:connect\.sid|session(?:[_-]?id)?)\s*[=:]\s*[^;\s<]+", "<session>", body)
+    body = re.sub(r"\b\d{10,13}\b", "<timestamp>", body)
+    return body
+
+
+def _http_request(task, jar, limiter: _HttpLimiter, method: str, path: str, data: Optional[dict] = None):
+    url = _probe_url(task, path)
+    allowed = task.raw.get("allowed_targets", [])
+    if not _allowed_target(url, allowed):
+        parsed = urlparse.urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        raise HttpProbeError("HTTP target not allowlisted: %s:%d" % (parsed.hostname or "", port))
+    limiter.wait()
+    payload = urlparse.urlencode(data).encode() if data is not None else None
+    req = urlrequest.Request(url, data=payload, method=method)
+    try:
+        with urlrequest.build_opener(urlrequest.HTTPCookieProcessor(jar)).open(req, timeout=20) as resp:
+            raw = resp.read(2 * 1024 * 1024).decode("utf-8", "replace")
+            return resp.status, raw
+    except HTTPError as e:
+        raw = e.read(2 * 1024 * 1024).decode("utf-8", "replace")
+        return e.code, raw
+    except URLError as e:
+        raise HttpProbeError("HTTP request failed for %s: %s" % (url, e.reason))
+
+
+def _http_snapshot(task) -> Dict:
+    cfg = task.raw.get("http_probe", {})
+    rate = float(cfg.get("rate_limit", 5))
+    limiter = _HttpLimiter(min(rate, 5.0))
+    jar = __import__("http.cookiejar", fromlist=["CookieJar"]).CookieJar()
+    login = cfg.get("login") or {}
+    if login:
+        login_path = login.get("path", "/login")
+        _, login_body = _http_request(task, jar, limiter, "GET", login_path)
+        parser = _CsrfParser(); parser.feed(login_body)
+        data = {"username": login.get("user", ""), "password": login.get("password", "")}
+        if parser.token:
+            data["_csrf"] = parser.token
+        _http_request(task, jar, limiter, "POST", login_path, data)
+    routes = cfg.get("routes", [])
+    results = {}
+    for route in routes:
+        status, body = _http_request(task, jar, limiter, "GET", route)
+        results[str(route)] = {"status": status, "body": _normalise_http_body(body)}
+    return results
+
+
+def http_baseline(task) -> Dict:
+    if not task.raw.get("http_probe"):
+        return {"skipped": True, "detail": "skipped (not configured)"}
+    try:
+        return {"snapshot": _http_snapshot(task)}
+    except HttpProbeError as e:
+        if str(e).startswith("HTTP request failed"):
+            return {"skipped": True, "detail": "skipped (app unreachable): %s" % e}
+        return {"error": str(e)}
+
+
+def http_g5(task, patched_tree: str, baseline: Dict) -> Tuple[bool, str]:
+    if not task.raw.get("http_probe"):
+        return True, "skipped (not configured)"
+    if baseline.get("skipped"):
+        return True, baseline.get("detail", "skipped (app unreachable)")
+    if baseline.get("error"):
+        return False, "baseline probe failed: %s" % baseline["error"]
+    cfg = task.raw["http_probe"]
+    restart = cfg.get("restart_cmd")
+    if not restart:
+        return True, "skipped (restart_cmd not configured; patched app not claimed running)"
+    cmd = util.resolve_command(restart) if isinstance(restart, list) else restart
+    result = util.run(cmd, cwd=patched_tree, timeout=int(cfg.get("restart_timeout", 60)))
+    if not result.ok:
+        return False, "restart_cmd failed: %s" % ((result.err or result.out).strip()[-240:])
+    try:
+        after = _http_snapshot(task)
+    except HttpProbeError as e:
+        return False, "patched probe failed: %s" % e
+    errors = []
+    for route, before in baseline.get("snapshot", {}).items():
+        current = after.get(route)
+        if current is None:
+            errors.append("%s missing" % route)
+        elif current["status"] != before["status"]:
+            errors.append("%s status %s -> %s" % (route, before["status"], current["status"]))
+        elif current["status"] >= 500 or re.search(r"(?i)<title[^>]*>\s*(?:error|internal server error)", current["body"]):
+            errors.append("%s became an error page" % route)
+        elif current["body"] != before["body"]:
+            errors.append("%s response changed" % route)
+    if errors:
+        return False, "behaviour changed: " + "; ".join(errors[:3])
+    return True, "%d route(s) preserved" % len(baseline.get("snapshot", {}))
 
 
 _PROOF_PROMPT = """Write a standalone proof test for the security fix below. It must run with
@@ -841,6 +1155,7 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
         "pov_size": 0, "pov_sha256": "", "repro_cmd": "re-run the analyzer on %s" % f.file,
         "pov_hexdump": f.snippet, "asan_report": "%s\n\n%s" % (f.message, f.fix_hint),
         "critical": f.critical, "duplicates": f.duplicates,
+        "model_calls": f.model_calls,
         "patch": ({"diff": chosen.diff, "source": chosen.source, "rationale": chosen.rationale,
                    "rejected": [c.status for c in cands if not c.chosen and c.status and c.status != "Verified"][:3]}
                   if chosen else {}),
@@ -890,6 +1205,9 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
     scratch = os.path.abspath(os.path.join(work_dir, "scratch"))
     base_tests: Tuple[Optional[bool], str] = (None, "")
     tests_checked = False
+    http_state = http_baseline(task)
+    if http_state.get("error"):
+        util.warn("HTTP G5 baseline unavailable: %s" % http_state["error"])
 
     for f in todo:
         util.stage("Repair & verify — %s" % f.id)
@@ -909,10 +1227,18 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             publish()
             continue
         cands: List[Candidate] = []
+        model_calls = 0
         mc = mechanical_fix(root, f)
         if mc:
             cands.append(mc)
-        cands += model_candidates(root, f, client if client.provider != "offline" else None)
+        if client.provider != "offline":
+            cands += model_candidates(root, f, client, raw_log_dir=os.path.join(work_dir, "llm_log"), call_no=1)
+            model_calls = 1
+            if not cands and model_calls < 2:
+                cands += model_candidates(root, f, client, prior_reason="the response could not be parsed into a candidate",
+                                          strict=True, raw_log_dir=os.path.join(work_dir, "llm_log"), call_no=2)
+                model_calls = 2
+        f.model_calls = model_calls
         if not cands:
             why = ("no mechanical fix for this pattern and no model configured (add --provider)"
                    if client.provider == "offline" else "model returned no usable diff")
@@ -937,6 +1263,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
 
         chosen: Optional[Candidate] = None
         validation: Dict = {"status": "Rejected", "gates": []}
+        reflection_used = False
         for c in cands:
             pol = check_policy(f, c.diff)
             if pol:
@@ -966,10 +1293,19 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                     ok = passed
             proof_path = None
             if ok:
-                res, d, proof_path = g4_proof(root, tree, f, c.diff, client if client.provider != "offline" else None, work_dir)
+                proof_client = None
+                if client.provider != "offline" and model_calls < 2:
+                    proof_client = client
+                    model_calls += 1
+                    f.model_calls = model_calls
+                res, d, proof_path = g4_proof(root, tree, f, c.diff, proof_client, work_dir)
                 gates.append({"name": "G4 proof test", "passed": res is not False,
                               "detail": d + ("" if res is not None else " (not claimed)")})
                 ok = res is not False
+            if ok:
+                g5_ok, g5_detail = http_g5(task, tree, http_state)
+                gates.append({"name": "G5 behaviour preserved", "passed": g5_ok, "detail": g5_detail})
+                ok = g5_ok
             c.gates = gates
             if ok:
                 c.status = "Verified"; c.chosen = True; chosen = c
@@ -984,8 +1320,12 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             util.step("%-28s %s" % (c.label, c.status))
             validation = {"status": "Rejected", "gates": gates}
             # reflection: tell the model why, once
-            if c.source == "model" and client.provider != "offline" and len(cands) < 4:
-                more = model_candidates(root, f, client, prior_reason=c.status + ": " + gates[-1]["detail"])
+            if c.source == "model" and client.provider != "offline" and not reflection_used and model_calls < 2:
+                reflection_used = True
+                model_calls += 1
+                f.model_calls = model_calls
+                more = model_candidates(root, f, client, prior_reason=c.status + ": " + gates[-1]["detail"],
+                                        strict=True, raw_log_dir=os.path.join(work_dir, "llm_log"), call_no=model_calls)
                 for m in more[:1]:
                     m.label = "retry: " + m.label
                     cands.append(m)

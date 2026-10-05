@@ -166,6 +166,8 @@ def cxx_for(cc: str) -> str:
         name = base.replace("clang", "clang++", 1) if "clang" in base else \
                base.replace("gcc", "g++", 1) if "gcc" in base else base + "++"
     d = os.path.dirname(cc)
+    if d and "/" in cc and "\\" not in cc:
+        return d.rstrip("/") + "/" + name
     return os.path.join(d, name) if d else name
 
 

@@ -140,6 +140,6 @@ def load_task(path: str, diff_override: Optional[str] = None,
 
 def rel_to_root(task: Task, abspath: str) -> str:
     try:
-        return os.path.relpath(abspath, task.root)
+        return os.path.relpath(abspath, task.root).replace(os.sep, "/")
     except ValueError:
-        return abspath
+        return abspath.replace(os.sep, "/")

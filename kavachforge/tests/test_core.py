@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 
@@ -138,9 +139,50 @@ class TestUtil(unittest.TestCase):
         self.assertIn("more bytes", s)
 
     def test_run_captures_exit(self):
-        r = util.run(["sh", "-c", "echo hi; exit 3"])
+        r = util.run([sys.executable, "-c", "print('hi'); raise SystemExit(3)"])
         self.assertEqual(r.code, 3)
         self.assertIn("hi", r.out)
+
+
+class TestUniversalPatchPortability(unittest.TestCase):
+    def test_python_applier_lf(self):
+        from kavachforge import universal as u
+        root = tempfile.mkdtemp()
+        path = os.path.join(root, "app.js")
+        util.write_text(path, "one\ntwo\nthree\n")
+        diff = "--- a/app.js\n+++ b/app.js\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+        u._apply_unified_python(root, diff)
+        self.assertEqual(util.read_text(path), "one\nTWO\nthree\n")
+
+    def test_python_applier_preserves_crlf(self):
+        from kavachforge import universal as u
+        root = tempfile.mkdtemp()
+        path = os.path.join(root, "app.js")
+        util.write_text(path, "one\r\ntwo\r\nthree\r\n")
+        diff = "--- a/app.js\n+++ b/app.js\n@@ -1,3 +1,3 @@\n one\n-two\n+TWO\n three\n"
+        u._apply_unified_python(root, diff)
+        self.assertEqual(util.read_text(path), "one\r\nTWO\r\nthree\r\n")
+
+    def test_python_applier_rejects_traversal(self):
+        from kavachforge import universal as u
+        root = tempfile.mkdtemp()
+        diff = "--- a/../escape.txt\n+++ b/../escape.txt\n@@ -0,0 +1 @@\n+nope\n"
+        with self.assertRaises(ValueError):
+            u._apply_unified_python(root, diff)
+
+    def test_python_applier_rejects_mismatched_hunk(self):
+        from kavachforge import universal as u
+        root = tempfile.mkdtemp()
+        util.write_text(os.path.join(root, "app.js"), "one\ntwo\n")
+        diff = "--- a/app.js\n+++ b/app.js\n@@ -1,2 +1,2 @@\n one\n-wrong\n+right\n"
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            u._apply_unified_python(root, diff)
+
+    def test_unified_headers_use_forward_slashes(self):
+        from kavachforge import universal as u
+        diff = u._unified("app\\nested\\app.js", "one\n", "two\n")
+        self.assertIn("--- a/app/nested/app.js\n", diff)
+        self.assertIn("+++ b/app/nested/app.js\n", diff)
 
 
 if __name__ == "__main__":
@@ -342,7 +384,10 @@ class TestRealWorldTarget(unittest.TestCase):
 
     def test_standalone_cov_flag_detected(self):
         from kavachforge import toolchain
-        tc = toolchain.detect("standalone")
+        try:
+            tc = toolchain.detect("standalone")
+        except RuntimeError as exc:
+            self.skipTest("native sanitizer toolchain unavailable: %s" % exc)
         # On clang/gcc with SanitizerCoverage, the engine is greybox-capable.
         self.assertIn(tc.engine, ("standalone", "libfuzzer"))
 
@@ -466,6 +511,8 @@ class TestUniversal(unittest.TestCase):
     def test_detect_and_builtin_rules(self):
         from kavachforge import universal as u
         root = self._repo()
+        os.makedirs(os.path.join(root, "config"))
+        util.write_text(os.path.join(root, "config", "app.config.js"), "const x = eval(input);\n")
         self.assertEqual(u.detect_stacks(root), ["node"])
         found, note = u.discover(root, ["node"], scanner="builtin")
         self.assertIn("built-in", note)
@@ -475,6 +522,7 @@ class TestUniversal(unittest.TestCase):
         self.assertEqual((ev.line, ev.end_line, ev.duplicates), (2, 3, 1))   # two evals, one finding
         self.assertTrue(ev.critical)                                          # auth.js is a critical area
         self.assertEqual(found[0].severity, "Critical")                       # ranked first
+        self.assertTrue(found[0].file.startswith("app/"))                     # app code before config
 
     def test_mechanical_fix_and_gates(self):
         from kavachforge import universal as u
@@ -502,6 +550,26 @@ class TestUniversal(unittest.TestCase):
         evil = "--- a/%s\n+++ b/%s\n@@ -1 +1,2 @@\n a\n+ child_process.exec(x)\n" % (f.file, f.file)
         self.assertIn("dangerous", u.check_policy(f, evil))
 
+    def test_policy_rejects_web_guardrails(self):
+        from kavachforge import universal as u
+        root = self._repo()
+        f = u.discover(root, ["node"], scanner="builtin")[0][0]
+        for addition, reason in (("app.get('/new', handler);", "HTTP route"),
+                                 ("fetch('https://example.test');", "outbound network"),
+                                 ("users.insertOne({role: 'admin'});", "users")):
+            diff = "--- a/%s\n+++ b/%s\n@@ -1,1 +1,2 @@\n a\n+%s\n" % (f.file, f.file, addition)
+            self.assertIn(reason, u.check_policy(f, diff))
+
+    def test_http_allowlist_and_normalization(self):
+        from kavachforge import universal as u
+        self.assertTrue(u._allowed_target("http://localhost:4000/login", ["localhost:4000"]))
+        self.assertFalse(u._allowed_target("http://localhost:5000/login", ["localhost:4000"]))
+        body = '<input type="hidden" name="_csrf" value="abc123"><p>1730000000000</p>'
+        normalized = u._normalise_http_body(body)
+        self.assertIn("<csrf>", normalized)
+        self.assertNotIn("abc123", normalized)
+        self.assertIn("<timestamp>", normalized)
+
     def test_model_edit_formats(self):
         from kavachforge import universal as u
         root = self._repo()
@@ -521,6 +589,18 @@ class TestUniversal(unittest.TestCase):
         c3 = u.candidate_from_text(root, f, "whole", whole)
         self.assertIn("Number(req.body.n)", c3.diff)
         self.assertIsNone(u.candidate_from_text(root, f, "none", "I cannot help with that."))
+
+    def test_model_edit_preserves_crlf_diff_shape(self):
+        from kavachforge import universal as u
+        root = self._repo()
+        path = os.path.join(root, "app", "auth.js")
+        util.write_text(path, util.read_text(path).replace("\n", "\r\n"))
+        f = next(x for x in u.discover(root, ["node"], scanner="builtin")[0] if x.cwe == "CWE-95")
+        sr = ("<<<<<<< SEARCH\n  const n = eval(req.body.n);\n=======\n"
+              "  const n = Number(req.body.n);\n>>>>>>> REPLACE\n")
+        c = u.candidate_from_text(root, f, "crlf", sr)
+        self.assertIn("+  const n = Number(req.body.n);", c.diff)
+        self.assertNotIn("+function login", c.diff)
 
     def test_approval_rules(self):
         from kavachforge import universal as u

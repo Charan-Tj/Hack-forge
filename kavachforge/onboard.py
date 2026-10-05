@@ -148,7 +148,7 @@ def _walk(root: str):
 
 
 def _excluded(rel: str) -> bool:
-    parts = rel.lower().split(os.sep)[:-1]
+    parts = rel.replace("\\", "/").lower().split("/")[:-1]
     return any(p in EXCLUDE_DIRS for p in parts)
 
 
@@ -158,9 +158,9 @@ def scan(root: str) -> Dict[str, List[str]]:
     for dp, _, fns in _walk(root):
         for fn in sorted(fns):
             p = os.path.join(dp, fn)
-            rel = os.path.relpath(p, root)
+            rel = os.path.relpath(p, root).replace(os.sep, "/")
             if fn.endswith((".h", ".hpp", ".hh")):
-                headers_dirs.add(os.path.dirname(rel) or ".")
+                headers_dirs.add(os.path.dirname(rel).replace("\\", "/") or ".")
                 continue
             if not fn.endswith(SRC_EXT):
                 continue
@@ -485,7 +485,7 @@ def _write_task(name: str, root: str, sources: List[str], harness: str,
                 incs: List[str], link_flags: List[str], seeds: List[str],
                 budget_s: int, description: str, probe: Optional[str] = None,
                 is_git: bool = False, patch_scope: Optional[List[str]] = None) -> str:
-    rel = lambda p: os.path.relpath(p, root)
+    rel = lambda p: os.path.relpath(p, root).replace(os.sep, "/")
     task = {
         "name": name,
         "language": "cpp" if any(toolchain.is_cxx(s) for s in sources + [harness]) else "c",
@@ -535,7 +535,7 @@ def generate_config(root: str, log=lambda m: None) -> List[str]:
 
 
 def rel_proj(p: str) -> str:
-    return os.path.relpath(p, config.PROJECT_ROOT)
+    return os.path.relpath(p, config.PROJECT_ROOT).replace(os.sep, "/")
 
 
 def sanity(tc, root: str, kept: List[str], habs: str, incs: List[str],

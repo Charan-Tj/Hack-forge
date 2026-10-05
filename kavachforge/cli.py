@@ -99,9 +99,11 @@ def _cmd_doctor(args) -> int:
         py.major, py.minor, py.micro, "" if py >= (3, 9) else "  (need 3.9+)"))
     ok = ok and py >= (3, 9)
     if shutil.which("patch"):
-        util.good("patch found")
+        util.good("patch found (G0 will try external patch first)")
     else:
-        util.bad("patch NOT found (required to apply patches)"); ok = False
+        util.warn("patch not found (G0 will use the built-in Python applier)")
+    util.info("G0 applier: %s" % ("external patch, then Python fallback" if shutil.which("patch")
+                                  else "built-in Python unified-diff applier"))
     try:
         tc = toolchain.detect(args.engine)
         util.good("toolchain: %s" % tc.note)
@@ -113,6 +115,11 @@ def _cmd_doctor(args) -> int:
     for cc in ("clang", "gcc"):
         util.info("  %s: %s" % (cc, shutil.which(cc) or "not found"))
     util.info("docker: %s" % (shutil.which("docker") or "not found (optional)"))
+    for tool in ("node", "npm"):
+        found = shutil.which(tool)
+        (util.good if found else util.warn)("%s: %s%s" % (
+            tool, found or "not found (optional for universal Node tasks)",
+            "" if found else "  (universal Node tests may be skipped)"))
     from . import llm, universal
     if universal.semgrep_available():
         cp = universal.cached_packs()
