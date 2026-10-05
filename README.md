@@ -201,11 +201,14 @@ crash to anchor on.
 ./kavach run nodegoat --approve all                                          # choose every patch yourself
 ```
 
-On OWASP NodeGoat (never seen before): 26 analyzer results → 11 unique findings (eval injection,
-hard-coded credentials, open redirect, session config, template XSS…); the eval injection in
-`handleContributionsUpdate` is patched by the local 7B model (two strategies offered, human
-approval requested because it is a request handler) and passes G0–G2; the test suite is
-reported *not runnable here* (needs MongoDB) rather than faked.
+On OWASP NodeGoat (never seen before), fully offline with the local `qwen2.5-coder:7b`:
+26 analyzer results → 11 unique findings (eval injection, hard-coded credentials, open
+redirect, session config, template XSS…). **Eval injection** in `handleContributionsUpdate`
+→ two strategies offered, human approval requested (request handler), `parseInt` fix passes
+G0–G2 — the same fix NodeGoat's own solution uses. **Open redirect** in `/learn` → allow-list
+validation, verified. Session-cookie finding → both model candidates **rejected at G2**
+(re-scan still fires) and reported as such. Committed secrets → *needs human action* (rotate),
+never "patched". The test suite is reported *not runnable here* (needs MongoDB) rather than faked.
 
 ### Fully offline
 

@@ -15,7 +15,8 @@ ollama serve &                                        # keep it running (or it a
 pip install semgrep                                   # any OS; pure pip
 
 # 3. cache everything KavachForge will need
-./kavach prefetch                                     # rule packs -> rules/semgrep/, pulls qwen2.5-coder:7b
+./kavach prefetch                                     # rule packs -> rules/semgrep/ (15 ship in the repo;
+                                                      #   p/secrets is fetched here), pulls qwen2.5-coder:7b
 ./kavach prefetch --model qwen2.5-coder:14b           # bigger model if the laptop can take it (see table)
 
 # 4. verify

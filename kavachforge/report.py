@@ -76,7 +76,7 @@ def _finding_card(f: Dict) -> str:
     color = SEV_COLOR.get(sev, "#8aa0b2")
     vstat = f.get("validation", {}).get("status", "Unpatched")
     verified = vstat == "Verified"
-    vcls = "verified" if verified else ("pending" if vstat == "Unpatched" else "rejected")
+    vcls = "verified" if verified else ("pending" if vstat in ("Unpatched", "Needs human action") else "rejected")
     vtxt = ("PATCH VERIFIED" if verified else
             "REPAIR PENDING" if vstat == "Unpatched" else vstat.upper())
     gates = "".join(_gate_badge(g) for g in f.get("validation", {}).get("gates", []))

@@ -895,6 +895,19 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         util.stage("Repair & verify — %s" % f.id)
         util.info("%s %s (%s) at %s:%d in %s%s" % (f.cwe, f.cwe_name, f.severity, f.file, f.line, f.func,
                                                    "  [CRITICAL AREA]" if f.critical else ""))
+        lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
+        if f.cwe == "CWE-798" or lang in ("", "yaml", "json"):
+            # A committed secret or a config/CI finding is not fixed by editing
+            # code: it needs a human to rotate/remove it or pin a dependency.
+            # Say so instead of burning model calls on a PEM file.
+            why = ("manual action: remove the credential from the repository and rotate it; "
+                   "no code patch can un-leak a committed secret" if f.cwe == "CWE-798" else
+                   "manual action: configuration/CI hygiene finding (pin or review), not a code patch")
+            util.warn(why)
+            findings_out.append(_finding_dict(f, [], None, {"status": "Needs human action", "gates": [],
+                                                            "detail": why}, None))
+            publish()
+            continue
         cands: List[Candidate] = []
         mc = mechanical_fix(root, f)
         if mc:
