@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# KavachForge launcher.
+#   ./kavach <command> ...            run natively (needs python3 + a C/ASan toolchain)
+#   ./kavach --docker <command> ...   run inside the KavachForge Docker image
+#
+# Examples:
+#   ./kavach doctor
+#   ./kavach demo
+#   ./kavach replay            # deterministic, offline, no API key
+#   ./kavach run tinyimg
+#   ./kavach serve             # open http://localhost:8777
+set -euo pipefail
+cd "$(dirname "$0")"
+
+if [[ "${1:-}" == "--docker" ]]; then
+  shift
+  IMAGE="kavachforge:latest"
+  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    echo "[kavach] building Docker image (first run only)..."
+    docker build -t "$IMAGE" .
+  fi
+  # pass through an API key if present so the loop can use a live model
+  ENVARGS=()
+  for v in ANTHROPIC_API_KEY OPENAI_API_KEY KAVACH_LLM_PROVIDER KAVACH_LLM_MODEL KAVACH_LLM_BUDGET; do
+    [[ -n "${!v:-}" ]] && ENVARGS+=("-e" "$v=${!v}")
+  done
+  exec docker run --rm -it \
+    -v "$PWD/artifacts:/app/artifacts" \
+    -v "$PWD/cache:/app/cache" \
+    -p 8777:8777 \
+    "${ENVARGS[@]}" "$IMAGE" "$@"
+fi
+
+PY="${PYTHON:-python3}"
+exec "$PY" -m kavachforge "$@"

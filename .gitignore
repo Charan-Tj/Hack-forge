@@ -1,0 +1,6 @@
+artifacts/
+cache/llm/
+**/__pycache__/
+*.pyc
+*.o
+*.out

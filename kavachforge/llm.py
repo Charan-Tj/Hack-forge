@@ -1,0 +1,159 @@
+"""Provider-agnostic LLM transport with budget control, caching and logging.
+
+Providers (selected by ``KAVACH_LLM_PROVIDER`` or --provider):
+
+  * ``anthropic`` - api.anthropic.com, key from ANTHROPIC_API_KEY
+  * ``openai``    - api.openai.com, key from OPENAI_API_KEY
+  * ``ollama``    - local server at OLLAMA_HOST (default http://localhost:11434)
+  * ``offline``   - no network; ``complete`` always raises LLMUnavailable so the
+                    caller uses its deterministic heuristic brain. This is the
+                    default when no API key is present, and is what ``replay``
+                    uses, so a full demo runs with no internet and no key.
+
+Only the Python standard library is used (urllib), so KavachForge has zero
+pip dependencies and runs anywhere Python 3.8+ is installed.
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+import urllib.error
+import urllib.request
+from typing import Optional
+
+from . import util
+
+
+class LLMUnavailable(Exception):
+    """Raised when no live model answer is available (offline, no key,
+    transport error, or budget exhausted). Callers fall back to a heuristic."""
+
+
+DEFAULT_MODELS = {
+    "anthropic": "claude-3-5-sonnet-20241022",
+    "openai": "gpt-4o-mini",
+    "ollama": "llama3.1",
+}
+
+
+class LLMClient:
+    def __init__(self, provider: Optional[str] = None, model: Optional[str] = None,
+                 budget: int = 6, cache_dir: str = "cache/llm",
+                 log_dir: str = "artifacts/llm_log"):
+        self.provider = (provider or os.environ.get("KAVACH_LLM_PROVIDER")
+                         or self._auto_provider())
+        self.model = (model or os.environ.get("KAVACH_LLM_MODEL")
+                      or DEFAULT_MODELS.get(self.provider, ""))
+        self.budget = int(os.environ.get("KAVACH_LLM_BUDGET", budget))
+        self.cache_dir = cache_dir
+        self.log_dir = log_dir
+        self.calls = 0           # live network calls actually made
+        self.cached = 0          # answers served from cache
+        self.last_source = None  # "live" | "cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(log_dir, exist_ok=True)
+
+    @staticmethod
+    def _auto_provider() -> str:
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return "anthropic"
+        if os.environ.get("OPENAI_API_KEY"):
+            return "openai"
+        if os.environ.get("KAVACH_USE_OLLAMA"):
+            return "ollama"
+        return "offline"
+
+    def describe(self) -> str:
+        if self.provider == "offline":
+            return "offline (deterministic heuristic brain, no network)"
+        return "%s / %s (budget %d calls)" % (self.provider, self.model, self.budget)
+
+    # -- caching -----------------------------------------------------------
+    def _key(self, system: str, prompt: str) -> str:
+        return util.sha256_bytes(
+            ("%s|%s|%s|%s" % (self.provider, self.model, system, prompt)).encode())
+
+    def _cache_path(self, key: str) -> str:
+        return os.path.join(self.cache_dir, key + ".json")
+
+    # -- main entry --------------------------------------------------------
+    def complete(self, prompt: str, system: str = "", max_tokens: int = 1500) -> str:
+        key = self._key(system, prompt)
+        cpath = self._cache_path(key)
+        if os.path.exists(cpath):
+            self.cached += 1
+            self.last_source = "cache"
+            data = util.read_json(cpath)
+            self._log(system, prompt, data["text"], "cache")
+            return data["text"]
+
+        if self.provider == "offline":
+            raise LLMUnavailable("offline provider selected")
+        if self.calls >= self.budget:
+            raise LLMUnavailable("LLM budget of %d calls exhausted" % self.budget)
+
+        try:
+            text = self._call_live(prompt, system, max_tokens)
+        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+                KeyError, ValueError, TimeoutError) as e:
+            self._log(system, prompt, "ERROR: %s" % e, "error")
+            raise LLMUnavailable("transport error: %s" % e)
+
+        self.calls += 1
+        self.last_source = "live"
+        util.write_json(cpath, {"provider": self.provider, "model": self.model,
+                                "text": text, "ts": time.time()})
+        self._log(system, prompt, text, "live")
+        return text
+
+    def _log(self, system: str, prompt: str, response: str, source: str) -> None:
+        idx = len(os.listdir(self.log_dir)) if os.path.isdir(self.log_dir) else 0
+        util.write_json(os.path.join(self.log_dir, "call_%03d.json" % idx),
+                        {"source": source, "provider": self.provider,
+                         "model": self.model, "system": system,
+                         "prompt": prompt, "response": response})
+
+    # -- transports --------------------------------------------------------
+    def _http(self, url: str, headers: dict, payload: dict, timeout: int = 60) -> dict:
+        body = json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+
+    def _call_live(self, prompt: str, system: str, max_tokens: int) -> str:
+        if self.provider == "anthropic":
+            key = os.environ["ANTHROPIC_API_KEY"]
+            out = self._http(
+                "https://api.anthropic.com/v1/messages",
+                {"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json"},
+                {"model": self.model, "max_tokens": max_tokens,
+                 "system": system or "You are a precise security engineer.",
+                 "messages": [{"role": "user", "content": prompt}]})
+            return "".join(b.get("text", "") for b in out["content"])
+
+        if self.provider == "openai":
+            key = os.environ["OPENAI_API_KEY"]
+            out = self._http(
+                "https://api.openai.com/v1/chat/completions",
+                {"Authorization": "Bearer %s" % key,
+                 "content-type": "application/json"},
+                {"model": self.model, "max_tokens": max_tokens,
+                 "messages": [{"role": "system", "content":
+                               system or "You are a precise security engineer."},
+                              {"role": "user", "content": prompt}]})
+            return out["choices"][0]["message"]["content"]
+
+        if self.provider == "ollama":
+            host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+            out = self._http(
+                host.rstrip("/") + "/api/chat",
+                {"content-type": "application/json"},
+                {"model": self.model, "stream": False,
+                 "messages": [{"role": "system", "content":
+                               system or "You are a precise security engineer."},
+                              {"role": "user", "content": prompt}]})
+            return out["message"]["content"]
+
+        raise LLMUnavailable("unknown provider %r" % self.provider)
