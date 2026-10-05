@@ -34,13 +34,19 @@ jobs:
           docker run --rm kavachforge:ci run tinyimg | tail -20
       - name: Publish to GHCR (push to main only)
         if: github.event_name == 'push'
+        continue-on-error: true
+        shell: bash
         run: |
+          set +e
           echo "${{ github.token }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          IMG=ghcr.io/${{ github.repository_owner }}/kavachforge
+          IMG=ghcr.io/$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')/kavachforge
           docker tag kavachforge:ci "${IMG}:latest"
           docker tag kavachforge:ci "${IMG}:${{ github.sha }}"
-          docker push "${IMG}:latest" && docker push "${IMG}:${{ github.sha }}" \
-            || echo "::warning::GHCR push failed (enable improved container permissions if needed); image still built & tested"
+          docker push "${IMG}:latest" && docker push "${IMG}:${{ github.sha }}"
+          if [ $? -ne 0 ]; then
+            echo "::warning::GHCR publish skipped/failed — the image built and passed its smoke test; enable packages write or make the package public to publish."
+          fi
+          exit 0
 
   kavachforge:
     runs-on: ubuntu-latest
