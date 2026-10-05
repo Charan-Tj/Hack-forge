@@ -44,7 +44,9 @@ def changed_files_from_diff_text(text: str) -> Dict[str, List[int]]:
             out[cur].append(new_line)
             new_line += 1
         elif line.startswith("-"):
-            pass
+            # a deletion touches the position where the line used to be
+            if new_line not in out[cur]:
+                out[cur].append(new_line)
         else:
             new_line += 1
     return out

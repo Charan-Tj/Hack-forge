@@ -91,8 +91,9 @@ def load_task(path: str, diff_override: Optional[str] = None,
         if not os.path.exists(dp):
             dp = _abs(PROJECT_ROOT, diff_src)
         changed_lines = ingest.changed_files_from_diff_file(dp)
-    if changed_lines:
-        diff_changed = sorted(set(diff_changed) | set(changed_lines))
+    if diff_src != "task":
+        # A live/real diff is authoritative: only what actually changed counts.
+        diff_changed = sorted(changed_lines)
 
     static_alerts = list(d.get("static_alerts", []))
     sarif_src = sarif_override or d.get("sarif") or ""

@@ -13,13 +13,32 @@ KavachForge turns a suspicious code change or a scanner alert into an **auditabl
                   ─▶ LLM patch (self-reflect) ─▶ build + PoV-replay + tests ─▶ signed evidence
 ```
 
-### Two hard gates (the whole point)
+### Three hard gates (the whole point)
 - **No finding without a reproducible proof-of-vulnerability (PoV).** Every crash is re-run in a fresh process before it counts; duplicates are collapsed by normalized stack signature (e.g. **46 raw crashes → 1 finding**).
 - **No "fix" until it is proven.** A patch is `Verified` only after it **applies**, **rebuilds**, makes the **PoV no longer crash**, and **passes the regression suite** — all in a clean, disposable worktree.
+- **No fix without a guard against regression.** The PoV becomes a permanent regression test, and the test is itself proven (fails unpatched, passes patched) before it ships in the PR.
 
 This is the AIxCC pattern (LLM + fuzzing + deterministic validation), deliberately narrowed so the full loop is credible and reliable live.
 
 ---
+
+## The "break it yourself" demo (self-healing, live)
+
+```bash
+./kavach watch cleanjson        # dashboard goes live; baseline run shows the target is clean
+```
+
+Now hand the keyboard to a judge: open `targets/cleanjson/src/cleanjson.c`, delete the
+bounds check (`if (idx >= size) break;`), save. Within seconds KavachForge:
+
+1. notices the edit via live `git diff` and ranks exactly that function (changed lines cited),
+2. finds the fault (~0.1 s), classifies it (CWE-125, Out-of-bounds Read),
+3. synthesizes the fix — the very line they deleted — and proves it through gates G0–G3,
+4. **generates a regression test from the proof-of-vulnerability and proves the test itself**
+   (G4: it crashes the unpatched code and passes the patched code),
+5. writes a merge-ready pull request: `PR.md` + one `fix.patch` carrying fix *and* test.
+
+`./kavach reset cleanjson` restores the original. Nothing leaves the local target directory.
 
 ## Showcase in one command
 
@@ -37,7 +56,7 @@ Other entry points:
 
 ```bash
 ./kavach doctor            # environment check (toolchain, patch, keys)
-./kavach selftest          # 23 built-in unit tests
+./kavach selftest          # 27 built-in unit tests
 ./kavach demo              # run all targets without the server
 ./kavach run tinyimg       # one target
 ./kavach replay            # deterministic offline run: no network, no key
@@ -142,7 +161,7 @@ kavachforge/
   llm.py          provider-agnostic transport (anthropic/openai/ollama/offline), cache, budget
   toolchain.py    engine detection + build recipes
   engine/kv_standalone_main.c   one-shot ASan driver for the portable engine
-  tests/          23 stdlib unit tests  (./kavach selftest)
+  tests/          27 stdlib unit tests  (./kavach selftest)
 targets/          2 vulnerable demo parsers + 1 clean control, each with harness, tests, sample diff/SARIF
 tasks/            task definitions
 ```

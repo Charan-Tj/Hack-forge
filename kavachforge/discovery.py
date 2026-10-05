@@ -68,6 +68,12 @@ def synth_seeds(task: "config.Task") -> List[bytes]:
     seeds.append(m + bytes([1, 2]) + bytes([10, 8, 20, 8]))
     # all-magic + ramp
     seeds.append(m + bytes(range(0, 64)))
+    # declared count/length far larger than the data actually present
+    # (classic "trusts the header" read-overflow trigger)
+    seeds.append(m + bytes([big]))
+    seeds.append(m + bytes([1, big]))
+    seeds.append(m + bytes([big, big, big]))
+    seeds.append(m + bytes([1, big]) + bytes([0x44]) * 8)
     return [s[:MAX_INPUT] for s in seeds]
 
 

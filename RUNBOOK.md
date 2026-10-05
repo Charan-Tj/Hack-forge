@@ -55,6 +55,26 @@ If the endpoint fails mid-run it falls back to cache/offline — the run complet
 7. **Control** — `cleanjson`: 10M+ execs, **no finding invented**. "We don't hallucinate bugs."
 8. **Boundary** — manifest hash, run log, LLM budget; human approves, nothing auto-deploys.
 
+## The closer — "break it yourself" (2 minutes, do this last)
+```bash
+./kavach watch cleanjson
+```
+Wait for `watching for edits…` (baseline shows the control is clean). Then:
+1. Hand a judge the laptop. Open `targets/cleanjson/src/cleanjson.c`.
+2. Ask them to delete the line `if (idx >= size) break;` and save.
+3. Say nothing. Within ~10 s the terminal and dashboard show: change detected →
+   function ranked from the live diff → crash → CWE-125 → **the deleted line
+   re-synthesized** → G0–G4 green → **regression test proven** → PR bundle.
+4. Open `artifacts/cleanjson/pr/KV-CLEANJ-001/PR.md` on screen: a merge-ready PR
+   with fix + test + evidence.
+5. `./kavach reset cleanjson` to restore. (Repeatable; do it twice if they ask.)
+
+Say: *"It didn't just patch it. It wrote the test that makes sure this bug can never
+come back, proved the test catches the bug, and wrote the PR. A human still clicks merge."*
+
+If the judge edits something that isn't a memory-safety bug, the run honestly reports
+"no verified crash" — that's the no-false-positive guarantee, say so.
+
 ## Likely judge questions (short answers)
 - *Real repos?* Yes: any libFuzzer/OSS-Fuzz-style harness; `--diff git --sarif file`.
 - *Why not just an LLM?* It hallucinates findings and "fixes" that hide tests. We gate on

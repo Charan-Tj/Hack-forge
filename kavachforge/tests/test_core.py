@@ -195,3 +195,53 @@ class TestLLMTransport(unittest.TestCase):
         a = patcher._normalize_report("==123==ERROR at 0xdeadbeef /home/u/x/src/t.c:5")
         b = patcher._normalize_report("==999==ERROR at 0x00c0ffee /tmp/q/src/t.c:5")
         self.assertEqual(a, b)
+
+
+class TestSelfHealing(unittest.TestCase):
+    """PoV -> regression test, read-overflow repair, CWE direction."""
+
+    def test_cwe_read_direction(self):
+        self.assertEqual(cwe.classify("heap-buffer-overflow", "Read 1B")["cwe"], "CWE-125")
+        self.assertEqual(cwe.classify("heap-buffer-overflow", "Write 33B")["cwe"], "CWE-787")
+
+    def test_short_body_seeds_present(self):
+        from kavachforge import discovery
+        t = config.load_task("cleanjson")
+        seeds = discovery.synth_seeds(t)
+        self.assertIn(b"CJSN\xff", seeds)
+
+    def test_read_overflow_repair_restores_bound(self):
+        """Delete the bounds check from the control target in a temp copy and
+        confirm the heuristic brain re-synthesizes it (clamp semantics)."""
+        import shutil
+        t = config.load_task("cleanjson")
+        tmp = tempfile.mkdtemp()
+        shutil.copytree(t.root, os.path.join(tmp, "cleanjson"))
+        src = os.path.join(tmp, "cleanjson", "src", "cleanjson.c")
+        text = util.read_text(src).replace("        if (idx >= size) break;          /* bounds-checked: no overflow */\n", "")
+        util.write_text(src, text)
+        t2 = config.Task(**{**t.__dict__, "root": os.path.join(tmp, "cleanjson"),
+                            "sources": [src], "patch_scope": [src]})
+        line = next(i for i, l in enumerate(text.splitlines(), 1) if "sum += data[idx]" in l)
+        f = verifier.Finding(id="t", signature="s", asan_class="heap-buffer-overflow",
+                             cwe="CWE-125", cwe_name="n", severity="High", access="Read 1B",
+                             crash_file="cleanjson.c:%d" % line, crash_func="cleanjson_parse")
+        pr = patcher.synth_patch(t2, f)
+        self.assertIsNotNone(pr)
+        self.assertIn("+        if (idx >= size) break;", pr.diff)
+
+    def test_regression_test_generation(self):
+        from kavachforge import regress
+        t = config.load_task("tinyimg")
+        d = tempfile.mkdtemp()
+        pov = os.path.join(d, "pov")
+        with open(pov, "wb") as fh:
+            fh.write(b"TIMG\x01\xff" + b"A" * 300)
+        f = verifier.Finding(id="KV-T-001", signature="s", asan_class="x", cwe="CWE-787",
+                             cwe_name="OOB", severity="High", access="Write 1B",
+                             crash_file="tinyimg.c:46", crash_func="tinyimg_parse",
+                             pov_path=pov, pov_sha256="ab" * 32, pov_size=306)
+        p = regress.generate(t, f, d)
+        s = util.read_text(p)
+        self.assertIn("LLVMFuzzerTestOneInput(kPoV_KV_T_001", s)
+        self.assertIn("0x54, 0x49, 0x4d, 0x47", s)   # "TIMG"

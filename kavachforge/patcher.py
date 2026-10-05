@@ -153,9 +153,38 @@ def synth_patch(task: "config.Task", finding: "verifier.Finding") -> Optional[Pa
     insert_at = None      # 0-based line index to insert BEFORE
     guard = None
 
+    # Strategy C: out-of-bounds READ of the input buffer (e.g. a loop that
+    # trusts a header count and indexes past the data actually supplied).
+    # Fix = bound the access by the size parameter; `break` inside a loop
+    # preserves clamp semantics, otherwise reject the input.
+    if (finding.access or "").lower().startswith("read") and 0 < line_no <= len(lines):
+        header = text[max(0, text.rfind("\n", 0, fstart) - 400):fstart]
+        sig = re.search(r"\(\s*const\s+(?:unsigned\s+char|uint8_t|char)\s*\*\s*(\w+)\s*,"
+                        r"\s*(?:size_t|unsigned|int|uint32_t)\s+(\w+)", header)
+        crash_line = lines[line_no - 1]
+        if sig:
+            buf, size_name = sig.group(1), sig.group(2)
+            am = re.search(r"\b%s\s*\[\s*([^\]]+?)\s*\]" % re.escape(buf), crash_line)
+            if am:
+                idx_expr = am.group(1).strip()
+                indent = re.match(r"\s*", crash_line).group(0)
+                # inside a loop? look upward for a for/while at shallower indent
+                in_loop = False
+                for j in range(line_no - 2, lo - 1, -1):
+                    lj = lines[j]
+                    ind_j = len(re.match(r"\s*", lj).group(0))
+                    if ind_j < len(indent) and re.search(r"\b(for|while)\s*\(", lj):
+                        in_loop = True
+                        break
+                    if ind_j < len(indent) and re.search(r"^\s*\}", lj):
+                        break
+                action = "break;" if in_loop else err_ret
+                insert_at = line_no - 1
+                guard = "%sif (%s >= %s) %s\n" % (indent, idx_expr, size_name, action)
+
     # Strategy B: unchecked memcpy length
     mm = re.search(r"memcpy\s*\(\s*([^,]+),\s*[^,]+,\s*([^)]+)\)", body)
-    if mm:
+    if insert_at is None and mm:
         dst, length = mm.group(1).strip(), mm.group(2).strip()
         # capacity: array field decl "... name[CAP];" for the dst field name
         field = dst.split("->")[-1].split(".")[-1].strip()

@@ -30,11 +30,22 @@ class Validation:
     status: str                       # "Verified" | "Rejected"
     gates: List[Gate] = field(default_factory=list)
     worktree_kept: Optional[str] = None
+    regress: Optional[object] = None  # regress.RegressResult when generated
 
     def as_dict(self) -> Dict:
-        return {"status": self.status,
-                "gates": [{"name": g.name, "passed": g.passed, "detail": g.detail}
-                          for g in self.gates]}
+        d = {"status": self.status,
+             "gates": [{"name": g.name, "passed": g.passed, "detail": g.detail}
+                       for g in self.gates]}
+        if self.regress is not None:
+            r = self.regress
+            d["regression_test"] = {
+                "file": os.path.basename(r.source_path),
+                "rel_test_path": r.rel_test_path,
+                "fails_unpatched": r.fails_unpatched,
+                "passes_patched": r.passes_patched,
+                "guards_bug": r.guards_bug,
+            }
+        return d
 
 
 def _remap(task: "config.Task", worktree: str, abspath: str) -> str:
@@ -106,8 +117,17 @@ def validate(task: "config.Task", tc: "toolchain.Toolchain", finding,
         tr = util.run([test_bin], env={"ASAN_OPTIONS": "detect_leaks=0"}, timeout=60)
         last = (tr.out.strip().splitlines() or ["(no output)"])[-1]
         gates.append(Gate("G3 tests", tr.ok, last))
-        status = "Verified" if tr.ok else "Rejected"
-        return Validation(status, gates, worktree if keep else None)
+        if not tr.ok:
+            return Validation("Rejected", gates, worktree if keep else None)
+
+        # G4: synthesize a regression test from the PoV and prove it guards
+        # the bug (crashes the unpatched tree, passes the patched tree).
+        from . import regress
+        rr = regress.prove(task, tc, finding, dst, work_dir, worktree)
+        gates.append(Gate("G4 regression test", rr.guards_bug, rr.detail))
+        # G0-G3 prove the patch; G4 proves the generated test. A G4 miss is
+        # reported on its gate but does not un-verify the patch itself.
+        return Validation("Verified", gates, worktree if keep else None, regress=rr)
     finally:
         if not keep:
             shutil.rmtree(worktree, ignore_errors=True)

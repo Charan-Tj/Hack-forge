@@ -72,3 +72,11 @@ Fallback if anything is flaky: `./kavach replay` (offline, deterministic).
 - Team Atlanta Atlantis CRS — github.com/Team-Atlanta
 - OSS-CRS: liberating AIxCC cyber-reasoning systems (research paper)
 - Terrier Cyber Quest 2026 / AI Kavach track
+
+## v1.2 — the closer (self-healing + self-testing)
+- `./kavach watch <target>`: a judge deletes a bounds check live; the system detects the
+  edit from `git diff`, finds the fault, re-synthesizes the exact line, proves the patch
+  (G0–G3), **generates a regression test from the PoV and proves it** (G4: fails
+  unpatched, passes patched), and writes a merge-ready PR (`PR.md` + `fix.patch`).
+- Line to land: "Finding and fixing is table stakes. We make sure the bug can never
+  come back — and we prove that too."

@@ -192,6 +192,92 @@ def _cmd_clean(args) -> int:
     return 0
 
 
+def _ensure_git(root: str) -> bool:
+    """Make the target a git repo with a baseline commit (so edits show up
+    as a diff and can be reset). Returns True if a repo was created."""
+    if util.run(["git", "-C", root, "rev-parse", "--is-inside-work-tree"]).ok \
+            and os.path.isdir(os.path.join(root, ".git")):
+        return False
+    util.run(["git", "-C", root, "init", "-q"])
+    util.run(["git", "-C", root, "add", "-A"])
+    util.run(["git", "-C", root, "-c", "user.name=KavachForge",
+              "-c", "user.email=kavach@local", "commit", "-q", "-m", "baseline"])
+    return True
+
+
+def _cmd_watch(args) -> int:
+    """Live mode: watch a target for edits; every saved change triggers the
+    full loop with risk ranking driven by the live `git diff`."""
+    import time
+    task = config.load_task(args.task)
+    root = task.root
+    if _ensure_git(root):
+        util.good("baseline committed for %s" % os.path.relpath(root))
+    os.makedirs(ART, exist_ok=True)
+    aroot = os.path.abspath(ART)
+    util.write_json(os.path.join(aroot, ".showcase.json"), {"tasks": [task.name]})
+    report.write_index(aroot, [task.name])
+    _start_server(args.port, aroot)
+    url = "http://localhost:%d/%s/dashboard.html" % (args.port, task.name)
+    util.plain(util.bold("\nKavachForge watch — %s" % task.name))
+    util.good("live dashboard: %s" % util.blue(url))
+    util.info("edit anything under %s and save — e.g. delete a bounds check in "
+              "%s" % (os.path.relpath(root), os.path.relpath(task.sources[0])))
+    util.info(util.dim("restore the original any time:  ./kavach reset %s" % task.name))
+    kw = _common_kwargs(args, getattr(args, "provider", None))
+    kw["diff"] = "git"
+
+    if not args.no_baseline:
+        util.plain(util.dim("\n[baseline run on the unmodified target]"))
+        try:
+            run_task(task.name, **kw)
+        except Exception as e:
+            util.bad("baseline failed: %s" % e)
+    util.plain("")
+    util.good("watching for edits…  (Ctrl-C to stop)")
+
+    last = ""
+    try:
+        while True:
+            d = util.run(["git", "-C", root, "diff", "HEAD", "--no-color"]).out
+            h = util.sha256_bytes(d.encode()) if d.strip() else ""
+            if h and h != last:
+                time.sleep(1.2)   # debounce: let the editor finish saving
+                d2 = util.run(["git", "-C", root, "diff", "HEAD", "--no-color"]).out
+                if util.sha256_bytes(d2.encode()) != h:
+                    continue
+                last = h
+                nfiles = d.count("\n+++ ")
+                util.plain(util.bold("\n%s change detected in %d file(s) — running"
+                                     % (util.yellow("●"), nfiles)))
+                try:
+                    run_task(task.name, **kw)
+                except Exception as e:
+                    util.bad("run failed: %s" % e)
+                util.plain("")
+                util.good("watching for edits…  (./kavach reset %s restores the "
+                          "original)" % task.name)
+            elif not h and last:
+                last = ""
+                util.good("target restored to baseline — watching…")
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print()
+    return 0
+
+
+def _cmd_reset(args) -> int:
+    task = config.load_task(args.task)
+    root = task.root
+    if not os.path.isdir(os.path.join(root, ".git")):
+        util.warn("%s has no baseline (run ./kavach watch first)" % task.name)
+        return 1
+    util.run(["git", "-C", root, "checkout", "--", "."])
+    util.run(["git", "-C", root, "clean", "-fdq"])
+    util.good("%s restored to baseline" % task.name)
+    return 0
+
+
 def _cmd_selftest(args) -> int:
     import unittest
     here = os.path.dirname(os.path.abspath(__file__))
@@ -239,6 +325,17 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("demo", help="run all bundled targets")
     common(sp); sp.set_defaults(func=_cmd_demo)
+
+    sp = sub.add_parser("watch", help="live mode: edit a target, it heals itself")
+    sp.add_argument("task", nargs="?", default="cleanjson")
+    sp.add_argument("--port", type=int, default=8777)
+    sp.add_argument("--no-baseline", action="store_true",
+                    help="skip the initial run on the unmodified target")
+    common(sp); sp.set_defaults(func=_cmd_watch)
+
+    sp = sub.add_parser("reset", help="restore a watched target to its baseline")
+    sp.add_argument("task", nargs="?", default="cleanjson")
+    sp.set_defaults(func=_cmd_reset)
 
     sp = sub.add_parser("doctor", help="check environment")
     sp.add_argument("--engine", choices=["libfuzzer", "standalone"], default=None)

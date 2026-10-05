@@ -12,8 +12,8 @@ import time
 import traceback
 from typing import Dict, List, Optional
 
-from . import (config, discovery, ingest, llm, patcher, report, risk,
-               toolchain, util, validator, verifier)
+from . import (config, discovery, ingest, llm, patcher, pr, report, risk,
+               toolchain, util, validator, verifier, __version__)
 
 STAGES = [
     ("risk", "Risk prioritization"),
@@ -233,24 +233,34 @@ def run_task(task_path: str, out_root: str = "artifacts",
         P.set("repair", "running" if findings else "skipped")
         for idx, f in enumerate(findings):
             util.stage("Repair & verify — %s" % f.id)
-            pr = patcher.propose(task, f, client, attempts=2)
+            pr_res = patcher.propose(task, f, client, attempts=2)
             validation = {"status": "Unpatched", "gates": []}
-            if pr is None:
+            v = None
+            if pr_res is None:
                 util.warn("no patch could be synthesized")
             else:
-                util.step("patch via %s (%d attempt(s))" % (pr.source, pr.attempts))
-                for rej in pr.rejected:
+                util.step("patch via %s (%d attempt(s))" % (pr_res.source, pr_res.attempts))
+                for rej in pr_res.rejected:
                     util.step(util.dim("reflected: " + rej))
-                v = validator.validate(task, tc, f, pr.diff, work_dir,
+                v = validator.validate(task, tc, f, pr_res.diff, work_dir,
                                        keep=keep_worktree)
                 validation = v.as_dict()
                 for g in v.gates:
                     (util.good if g.passed else util.bad)("%s — %s" % (g.name, g.detail))
                 if v.status == "Verified":
                     util.good(util.green("PATCH VERIFIED — builds, blocks PoV, tests pass"))
+                    if v.regress is not None and v.regress.guards_bug:
+                        util.good(util.green("REGRESSION TEST PROVEN — %s"
+                                             % os.path.basename(v.regress.source_path)))
                 else:
                     util.bad("patch rejected at an evidence gate")
-            P.findings[idx] = _finding_dict(f, work_dir, pr, validation)
+            fd = _finding_dict(f, work_dir, pr_res, validation)
+            if pr_res is not None and validation.get("status") == "Verified":
+                rs = v.regress.source_path if v.regress is not None else None
+                fd["pr_bundle"] = pr.build(task, f, fd["patch"], validation, rs,
+                                           work_dir, __version__)
+                util.good("PR bundle: %s" % fd["pr_bundle"]["dir"])
+            P.findings[idx] = fd
             P.publish()
         if findings:
             P.set("repair", "done")

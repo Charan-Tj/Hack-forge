@@ -98,9 +98,9 @@ def verify(task: "config.Task", fuzzer_bin: str,
             seen[sig].duplicates += 1
             continue
 
-        cls = cwe.classify(asan_class)
         op = _OP_RE.search(blob)
         access = ("%s %sB" % (op.group(1).title(), op.group(2))) if op else "n/a"
+        cls = cwe.classify(asan_class, access)
         site = next((f for f in frames if f["in_target"]), frames[0] if frames else None)
         with open(pov, "rb") as f:
             data = f.read()

@@ -28,10 +28,17 @@ _TABLE = [
 _SEVERITY_RANK = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1, "Unknown": 0}
 
 
-def classify(asan_class: str) -> Dict[str, str]:
+def classify(asan_class: str, access: str = "") -> Dict[str, str]:
+    """Map a sanitizer class (+ READ/WRITE direction) to CWE + severity.
+    ASan reports *-buffer-overflow for both reads and writes; the direction
+    decides between CWE-787 (write) and CWE-125 (read)."""
     cls = (asan_class or "").lower()
     for needle, (cwe, name, sev) in _TABLE:
         if needle.lower() in cls:
+            if "buffer-overflow" in cls and (access or "").lower().startswith("read"):
+                region = name[name.find("("):] if "(" in name else ""
+                return {"cwe": "CWE-125", "cwe_name": "Out-of-bounds Read " + region,
+                        "severity": "High"}
             return {"cwe": cwe, "cwe_name": name, "severity": sev}
     return {"cwe": "CWE-Unknown", "cwe_name": "Unclassified memory-safety fault",
             "severity": "Unknown"}

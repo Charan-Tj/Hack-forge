@@ -96,6 +96,23 @@ def _finding_card(f: Dict) -> str:
     dups = f.get("duplicates", 0)
     dup_txt = (" &nbsp;|&nbsp; <b>%d</b> duplicate crash(es) collapsed into this finding"
                % dups) if dups else ""
+    deliver = ""
+    rt = f.get("validation", {}).get("regression_test")
+    pb = f.get("pr_bundle")
+    if rt or pb:
+        bits = []
+        if rt:
+            bits.append('<a class="dl-link %s" href="regress/%s" target="_blank">'
+                        '&#9881; regression test %s</a>'
+                        % ("ok" if rt.get("guards_bug") else "", _e(rt["file"]),
+                           "(proven: fails unpatched, passes patched)" if rt.get("guards_bug")
+                           else "(generated)"))
+        if pb:
+            bits.append('<a class="dl-link ok" href="%s" target="_blank">&#128203; PR.md</a>'
+                        % _e(pb["md"]))
+            bits.append('<a class="dl-link ok" href="%s" target="_blank">&#128190; fix.patch '
+                        '(fix + test)</a>' % _e(pb["patch"]))
+        deliver = '<h4>Merge-ready deliverables</h4><div class="deliver">%s</div>' % " ".join(bits)
     return """
     <div class="card">
       <div class="chead">
@@ -125,6 +142,7 @@ def _finding_card(f: Dict) -> str:
           %s
           <h4>Verification gates</h4>
           <div class="gates">%s</div>
+          %s
         </div>
       </div>
     </div>""" % (
@@ -136,7 +154,7 @@ def _finding_card(f: Dict) -> str:
         _e(f.get("pov_hexdump", "")),
         _e(f.get("asan_report", "")),
         _e(patch.get("source", "")), _e(patch.get("rationale", "")),
-        reflect, diff_block, gates)
+        reflect, diff_block, gates, deliver)
 
 
 def _risk_rows(ledger: List[Dict]) -> str:
@@ -345,6 +363,10 @@ pre.hex{max-height:150px}pre.asan{max-height:230px;white-space:pre-wrap}
 .gate.ok{background:#12361f;color:var(--ok);border-color:#1f5e36}
 .gate.no{background:#3a1b22;color:var(--bad);border-color:#5e1f2c}
 .reflect{color:var(--mut);font-size:12px;margin:6px 0}
+.deliver{display:flex;flex-wrap:wrap;gap:6px}
+.dl-link{display:inline-block;border:1px solid var(--line);border-radius:6px;padding:4px 9px;font-size:12px;color:var(--mut)}
+.dl-link.ok{color:var(--ok);border-color:#1f5e36}
+.dl-link:hover{border-color:var(--acc);color:var(--tx)}
 .muted{color:var(--mut)}
 .tgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:18px}
 .tcard{display:block;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px;transition:transform .12s}
