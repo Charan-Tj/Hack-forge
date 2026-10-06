@@ -388,10 +388,16 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
             log("semgrep: %d result(s) (%s)" % (len(found), note))
         else:
             log(note + " - falling back to built-in rules")
-    if not found and scanner != "semgrep":
-        found = run_builtin(root, files)
+    if scanner != "semgrep":
+        # Always add the built-in patterns: they catch sinks the registry's
+        # taint rules miss when the source is a function argument rather
+        # than the request itself (e.g. an f-string SQL query in a model).
+        extra = run_builtin(root, files)
+        have = {(f.cwe, f.file, f.line) for f in found}
+        extra = [e for e in extra if (e.cwe, e.file, e.line) not in have]
+        found += extra
         note = (note + "; " if note else "") + "built-in rules (%d patterns, no network)" % len(BUILTIN_RULES)
-        log("built-in rules: %d result(s)" % len(found))
+        log("built-in rules: %d additional result(s)" % len(extra))
     # dedupe: same weakness in the same function within a few lines is ONE
     # finding (one repair), e.g. three eval() calls in one handler
     found.sort(key=lambda f: (f.file, f.line))
@@ -731,6 +737,8 @@ def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optiona
         tail = (r.out.strip().splitlines() or r.err.strip().splitlines() or ["(no output)"])[-1][-160:]
         if r.code == 124:
             return None, "suite timed out after %ds" % timeout
+        if r.code == 5 or "no tests ran" in blob:
+            return None, "no tests collected"
         if re.search(r"No module named (pytest|unittest)|command not found|ENOENT|Cannot find module|"
                      r"ECONNREFUSED|MongoNetworkError|connect ECONNREFUSED|could not connect", blob):
             return None, "suite cannot run here: " + tail
