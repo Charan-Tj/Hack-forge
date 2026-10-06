@@ -3,7 +3,8 @@
 Providers (selected by ``KAVACH_LLM_PROVIDER`` or --provider):
 
   * ``anthropic`` - api.anthropic.com, key from ANTHROPIC_API_KEY
-  * ``openai``    - api.openai.com, key from OPENAI_API_KEY
+  * ``openai``    - api.openai.com, key from OPENAI_API_KEY; or ANY OpenAI-compatible
+                    server (vLLM, llama.cpp, TGI on an HPC node) via OPENAI_BASE_URL
   * ``ollama``    - local server at OLLAMA_HOST (default http://localhost:11434)
   * ``offline``   - no network; ``complete`` always raises LLMUnavailable so the
                     caller uses its deterministic heuristic brain. This is the
@@ -175,9 +176,12 @@ class LLMClient:
             return "".join(b.get("text", "") for b in out["content"])
 
         if self.provider == "openai":
-            key = os.environ["OPENAI_API_KEY"]
+            # Any OpenAI-compatible server works: vLLM / llama.cpp / TGI on an HPC
+            # node, e.g. OPENAI_BASE_URL=http://hpc-node:8000/v1 OPENAI_API_KEY=x
+            key = os.environ.get("OPENAI_API_KEY", "none")
+            base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
             out = self._http(
-                "https://api.openai.com/v1/chat/completions",
+                base + "/chat/completions",
                 {"Authorization": "Bearer %s" % key,
                  "content-type": "application/json"},
                 {"model": self.model, "max_tokens": max_tokens,
