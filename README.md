@@ -210,6 +210,19 @@ validation, verified. Session-cookie finding → both model candidates **rejecte
 (re-scan still fires) and reported as such. Committed secrets → *needs human action* (rotate),
 never "patched". The test suite is reported *not runnable here* (needs MongoDB) rather than faked.
 
+**Logic bugs — the model review stage.** Pattern matching cannot see missing authorization or
+mass assignment, so the universal track also hands each request-handler file to the local model
+with an API-security checklist (BOLA/IDOR, missing auth, mass assignment, data exposure,
+enumeration, ReDoS, rate limiting, weak JWT). Every reported issue must cite an exact substring
+that really is on the cited line — anything paraphrased is discarded as hallucination — and the
+cards are labelled *model review — unverified by a tool*. On **OWASP VAmPI** (9 documented
+vulnerabilities, Flask) with the local 7B model: **13 findings, 5 patched & verified** — SQL
+injection (parameterised), BOLA on `/books/<title>` (ownership filter), **unauthorized password
+change** (caller must be the user or admin — the same logic as VAmPI's own secure branch),
+hard-coded secret → environment variable, and an unauthenticated state change; debug endpoint,
+mass assignment, ReDoS and missing rate limiting are reported for a human; 2 of the 9 (user
+enumeration, weak JWT key) were not surfaced.
+
 ### Fully offline
 
 `./kavach prefetch` caches the rule packs and pulls a local model; after that nothing needs

@@ -71,7 +71,7 @@ CRITICAL_RE = re.compile(r"(auth|login|signin|session|passw|credential|crypt|tok
                          r"payment|billing|checkout|admin|privilege|permission|config|\.env|settings)",
                          re.I)
 CRITICAL_CWES = {"CWE-78", "CWE-89", "CWE-94", "CWE-95", "CWE-502", "CWE-22", "CWE-611", "CWE-917",
-                 "CWE-943", "CWE-98", "CWE-434", "CWE-287", "CWE-798"}
+                 "CWE-943", "CWE-98", "CWE-434", "CWE-287", "CWE-798", "CWE-639", "CWE-862", "CWE-863"}
 
 
 def detect_stacks(root: str) -> List[str]:
@@ -137,7 +137,15 @@ _CWE_NAMES = {"CWE-78": "OS Command Injection", "CWE-79": "Cross-site Scripting"
               "CWE-352": "CSRF", "CWE-287": "Improper Authentication", "CWE-116": "Improper Encoding",
               "CWE-693": "Protection Mechanism Failure", "CWE-915": "Mass Assignment", "CWE-400": "Resource Exhaustion",
               "CWE-1021": "Clickjacking", "CWE-1275": "SameSite Cookie", "CWE-120": "Classic Buffer Overflow",
-              "CWE-98": "File Inclusion", "CWE-434": "Unrestricted Upload", "CWE-917": "Expression Language Injection"}
+              "CWE-98": "File Inclusion", "CWE-434": "Unrestricted Upload", "CWE-917": "Expression Language Injection",
+              "CWE-639": "Broken Object Level Authorization (IDOR)", "CWE-862": "Missing Authorization",
+              "CWE-863": "Incorrect Authorization", "CWE-915": "Mass Assignment", "CWE-200": "Information Exposure",
+              "CWE-204": "Observable Response Discrepancy (Enumeration)", "CWE-1333": "Inefficient Regular Expression (ReDoS)",
+              "CWE-770": "Missing Rate Limiting", "CWE-347": "Improper Verification of Cryptographic Signature",
+              "CWE-215": "Debug Endpoint Exposed", "CWE-521": "Weak Password Requirements", "CWE-306": "Missing Authentication",
+              "CWE-489": "Active Debug Code / Hard-coded Config", "CWE-269": "Improper Privilege Management",
+              "CWE-250": "Execution with Unnecessary Privileges", "CWE-1357": "Unpinned Dependency", "CWE-319": "Cleartext Transmission",
+              "CWE-522": "Insufficiently Protected Credentials"}
 
 
 def cwe_name_for(cwe_id: str) -> str:
@@ -342,6 +350,22 @@ BUILTIN_RULES = [
      "TLS verification disabled.", (r"InsecureSkipVerify\s*:\s*true", "InsecureSkipVerify: false")),
     (("ruby",), r"\bsystem\s*\(.*#\{|`[^`]*#\{", "CWE-78", "OS Command Injection", "High",
      "Shell command with interpolation.", None),
+    (("python",), r"jwt\.decode\s*\([^)]*verify\s*=\s*False|jwt\.decode\s*\((?:[^)]*\))?(?![^;\n]*algorithms)", "CWE-347",
+     "Improper Verification of Cryptographic Signature", "High", "JWT decoded without pinning the algorithm / with verification off.", None),
+    (("javascript", "typescript"), r"jwt\.verify\s*\([^)]*algorithms\s*:\s*\[[^\]]*['\"]none['\"]|jwt\.decode\s*\(", "CWE-347",
+     "Improper Verification of Cryptographic Signature", "High", "JWT decoded without signature verification.", None),
+    (("python",), r"\w+\s*\(\s*\*\*\s*(?:request\.(?:json|get_json\(\)|form|args)|data|body|payload|json_data)\s*\)", "CWE-915",
+     "Mass Assignment", "High", "Request body splatted straight into a constructor/update: clients can set fields they should not (e.g. admin).", None),
+    (("javascript", "typescript"), r"Object\.assign\s*\([^,]+,\s*req\.body\)|\.(?:create|update|insertOne|save)\s*\(\s*req\.body\s*[,)]|new\s+\w+\s*\(\s*req\.body\s*\)", "CWE-915",
+     "Mass Assignment", "High", "Request body passed whole to a model: clients can set fields they should not.", None),
+    (("python", "javascript", "typescript", "java", "go", "php", "ruby"), r"[\"'`]/_?(?:debug|_debug|internal|admin/debug)[\"'`]", "CWE-215",
+     "Debug Endpoint Exposed", "High", "A debug route is registered; it typically leaks full records.", None),
+    (("yaml",), r"^\s*/[\w/{}\-]*_?debug\w*/?:\s*$", "CWE-215", "Debug Endpoint Exposed", "High",
+     "An OpenAPI/route spec registers a debug path; such endpoints typically leak full records.", None),
+    (("python", "javascript", "typescript", "java", "go", "ruby"), r"(?:\([^()]*[+*][^()]*\)|\[[^\]]+\][+*]|\\w[+*])\s*[+*?]?\s*(?:\\.|\[|\()[^'\"]*[+*]", "CWE-1333",
+     "Inefficient Regular Expression (ReDoS)", "Medium", "Regex with nested/adjacent unbounded quantifiers on user input can take exponential time.", None),
+    (("python",), r"\bre\.(?:search|match|fullmatch|findall)\s*\(\s*['\"][^'\"]*(?:\+\)[+*]|\][+*][^'\"]*\][+*]|\w[+*]\[[^\]]*\][+*])", "CWE-1333",
+     "Inefficient Regular Expression (ReDoS)", "Medium", "Regex with adjacent unbounded quantifiers applied to request data.", None),
     (("c", "cpp"), r"\b(?:gets|strcpy|strcat|sprintf)\s*\(", "CWE-120", "Classic Buffer Overflow", "High",
      "Unbounded copy/format into a buffer.", None),
     (("c", "cpp"), r"\bsystem\s*\(", "CWE-78", "OS Command Injection", "Medium",
@@ -353,7 +377,7 @@ def run_builtin(root: str, files: List[str]) -> List[SFinding]:
     out: List[SFinding] = []
     for rel in files:
         lang = EXT_LANG.get(os.path.splitext(rel)[1], "")
-        if not lang or lang in ("yaml", "json"):
+        if not lang or lang == "json":
             continue
         try:
             text = util.read_text(os.path.join(root, rel))
@@ -416,11 +440,164 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
             continue
         f.signature = util.sha256_bytes(("%s|%s|%s" % (f.cwe, f.file, f.func or f.line)).encode())[:16]
         merged.append(f)
-    def _rank(f: SFinding):
-        lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
-        code = 0 if lang not in ("", "yaml", "json") else 1      # code before config/CI
-        return (code, -cwemod.severity_rank(f.severity), f.file, f.line)
-    return sorted(merged, key=_rank), note
+    return sorted(merged, key=rank_key), note
+
+
+def rank_key(f: SFinding):
+    lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
+    code = 0 if lang not in ("", "yaml", "json") else 1      # code before config/CI
+    return (code, -cwemod.severity_rank(f.severity), f.file, f.line)
+
+
+def patchable(f: SFinding) -> bool:
+    """Findings that a code patch can address (secrets and config/CI hygiene
+    go to a human instead and must not consume repair slots)."""
+    lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
+    return f.cwe != "CWE-798" and lang not in ("", "yaml", "json")
+
+
+# ---------------------------------------------------------------------------
+# model review (semantic audit of handlers - the logic bugs patterns cannot see)
+# ---------------------------------------------------------------------------
+_HANDLER_HINT = re.compile(
+    r"@\w*\.?(?:route|get|post|put|delete|patch|api_view|RequestMapping|GetMapping|PostMapping)\b|"
+    r"\b(?:app|router|server)\.(?:get|post|put|delete|patch|use|all)\s*\(|operationId:|"
+    r"http\.HandleFunc|ServeHTTP|Route::|def \w+\(request|request\.(?:json|args|form|body|headers|get_json)|"
+    r"req\.(?:body|params|query|headers)|\$_(?:GET|POST|REQUEST)|params\[", re.M)
+
+REVIEW_CHECKLIST = """Review this server-side code as an application-security auditor. Look specifically for:
+- Broken object-level authorization (IDOR): a handler reads/updates/deletes a record by an id or username
+  taken from the request without checking that the authenticated user owns it or is admin (CWE-639/862/863)
+- Missing authentication on a state-changing endpoint, e.g. password change without verifying the caller (CWE-306)
+- Mass assignment: request fields (e.g. 'admin', 'role', 'is_staff') copied into a model without an allow-list (CWE-915)
+- Excessive data exposure: endpoints or helpers that return password hashes, tokens, secrets or all users' private fields (CWE-200)
+- User/password enumeration: different error messages or status codes for 'no such user' vs 'wrong password' (CWE-204)
+- Injection: SQL/NoSQL/command/template built from request data (CWE-89/943/78/94)
+- Regex on user input with nested or adjacent unbounded quantifiers (ReDoS, CWE-1333)
+- Missing rate limiting / brute-force protection on login, OTP or token endpoints (CWE-770) - only if the file clearly
+  defines such an endpoint with no limiter
+- Weak JWT handling: unverified decode, 'none' algorithm, hard-coded or trivial signing key (CWE-347)
+- Hard-coded credentials or secrets (CWE-798)
+"""
+
+_REVIEW_PROMPT = """{checklist}
+Report ONLY issues you can point to in this file. For each, cite the line number and copy an exact
+substring of that line as `evidence` (this is checked mechanically; an issue whose evidence is not on
+that line is discarded). Be precise, not exhaustive: skip style issues and anything speculative.
+
+Report at most 6 issues, most severe first. Answer with a JSON array only, no prose:
+[{{"line": <int>, "function": "<name>", "cwe": "CWE-<n>", "title": "<short>", "severity": "High|Medium|Low",
+  "evidence": "<exact substring of that line>", "why": "<one sentence>", "fix": "<one sentence>"}}]
+Return [] if there is nothing.
+
+File: {file}
+--- code (leading numbers are line numbers, not code) ---
+{code}
+"""
+
+
+def review_files(root: str, files: List[str], limit: int = 8) -> List[str]:
+    """Handler-looking source files first (routes, request access), capped."""
+    scored = []
+    for rel in files:
+        lang = EXT_LANG.get(os.path.splitext(rel)[1], "")
+        if not lang or lang in ("yaml", "json") or any(p in SKIP_DIRS for p in rel.split("/")):
+            continue
+        try:
+            text = util.read_text(os.path.join(root, rel))
+        except Exception:
+            continue
+        n = len(_HANDLER_HINT.findall(text))
+        if n:
+            scored.append((n, rel, text.count("\n")))
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    return [rel for _, rel, _ in scored[:limit]]
+
+
+def _parse_review(resp: str) -> List[dict]:
+    """Parse the model's JSON array; if the answer was truncated or sloppy,
+    salvage every complete object in it (small models run out of tokens)."""
+    m = re.search(r"\[.*\]", resp, re.DOTALL)
+    if m:
+        for txt in (m.group(0), re.sub(r",\s*([}\]])", r"\1", m.group(0))):
+            try:
+                items = json.loads(txt)
+                return [i for i in items if isinstance(i, dict)]
+            except Exception:
+                pass
+    out = []
+    for om in re.finditer(r"\{[^{}]*\}", resp, re.DOTALL):
+        try:
+            d = json.loads(om.group(0))
+            if isinstance(d, dict) and "line" in d:
+                out.append(d)
+        except Exception:
+            continue
+    return out
+
+
+def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], existing: List[SFinding],
+                 limit: int = 8, log=lambda m: None) -> List[SFinding]:
+    """Ask the model to audit handler files; keep only findings whose cited
+    evidence really is on the cited line (hallucination filter) and which
+    static analysis has not already reported."""
+    if client is None:
+        return []
+    out: List[SFinding] = []
+    have = {(f.cwe, f.file) : f for f in existing}
+    for rel in review_files(root, files, limit):
+        text = util.read_text(os.path.join(root, rel))
+        lines = text.splitlines()
+        if len(lines) > 420:
+            lines_shown = lines[:420]
+        else:
+            lines_shown = lines
+        code = "\n".join("%4d  %s" % (i + 1, l) for i, l in enumerate(lines_shown))
+        try:
+            resp = client.complete(_REVIEW_PROMPT.format(checklist=REVIEW_CHECKLIST, file=rel, code=code),
+                                   system="You are a precise application-security auditor. JSON only.",
+                                   max_tokens=2000)
+        except llm.LLMUnavailable as e:
+            util.warn("model review stopped: %s" % e)
+            break
+        kept = dropped = 0
+        for it in _parse_review(resp):
+            try:
+                ln = int(it.get("line", 0))
+            except (TypeError, ValueError):
+                continue
+            ev = str(it.get("evidence", "")).strip()
+            if not (1 <= ln <= len(lines)) or not ev:
+                dropped += 1; continue
+            # evidence must really be in the file: on the cited line (+-3 for
+            # models that miscount), or at a unique location elsewhere (then
+            # relocate). Paraphrased "evidence" is discarded as hallucination.
+            hit = next((j for j in range(ln - 3, ln + 4) if 1 <= j <= len(lines) and ev in lines[j - 1]), None)
+            if hit is None:
+                where = [j + 1 for j, l in enumerate(lines) if ev in l]
+                hit = where[0] if len(where) == 1 else None
+            if hit is None:
+                dropped += 1; continue
+            cwe_id = str(it.get("cwe", "")).strip().upper()
+            if not re.match(r"CWE-\d+$", cwe_id):
+                cwe_id = "CWE-693"
+            sev = str(it.get("severity", "Medium")).title()
+            if sev not in ("High", "Medium", "Low"):
+                sev = "Medium"
+            # already known from static analysis nearby? skip
+            if any(e.cwe == cwe_id and e.file == rel and abs(e.line - hit) <= 8 for e in existing + out):
+                dropped += 1; continue
+            snippet = "\n".join("%5d  %s" % (i + 1, lines[i]) for i in range(max(0, hit - 3), min(len(lines), hit + 2)))
+            out.append(SFinding(id="", rule="model-review", cwe=cwe_id,
+                                cwe_name=str(it.get("title") or cwe_name_for(cwe_id))[:80], severity=sev,
+                                file=rel, line=hit, end_line=hit,
+                                message=("%s (model review - unverified by a tool)" % str(it.get("why", "")).strip())[:400],
+                                snippet=snippet, func=str(it.get("function") or _enclosing_func(lines, hit, "")),
+                                source="model-review", fix_hint=str(it.get("fix", ""))[:300],
+                                critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES))
+            kept += 1
+        log("review %-36s %d finding(s) kept, %d discarded (evidence not on cited line / duplicate)" % (rel, kept, dropped))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -532,7 +709,10 @@ def _apply_search_replace(original: str, blocks: List[Tuple[str, str]]) -> Optio
         replace = _strip_line_numbers(replace).rstrip("\n")
         if not search.strip():
             return None
-        if search in text:
+        # exact match only at a line boundary: a SEARCH that lost its leading
+        # indentation must go through the re-indenting path below, or the
+        # second replacement line would land at column 0 (IndentationError).
+        if text.startswith(search) or ("\n" + search) in text:
             text = text.replace(search, replace, 1)
             continue
         # tolerant: compare lines with whitespace stripped
@@ -595,7 +775,8 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
     try:
         resp = client.complete(prompt, system="You are a careful application-security engineer. "
                                               "You answer only in the requested edit format.", max_tokens=1800)
-    except llm.LLMUnavailable:
+    except llm.LLMUnavailable as e:
+        util.warn("model unavailable for repair: %s" % e)
         return []
     parts = re.split(r"^###\s*STRATEGY:\s*(.+?)\s*$", resp, flags=re.MULTILINE)
     chunks: List[Tuple[str, str]] = []
@@ -687,6 +868,37 @@ def g1_syntax(tree: str, rel: str) -> Tuple[bool, str]:
     if r.ok:
         return True, "%s: ok" % os.path.basename(cmd[0])
     return False, (r.err.strip().splitlines() or r.out.strip().splitlines() or ["syntax error"])[0][-200:]
+
+
+_REREVIEW_PROMPT = """A security issue was reported in this function and a patch was applied. Issue:
+{cwe} {title} at line {line}: {why}
+
+Patched code of the file region:
+{code}
+
+Is the specific issue above STILL present after the patch? Answer with one word first: FIXED or PRESENT,
+then one sentence of justification."""
+
+
+def g2_rereview(tree: str, f: SFinding, client: Optional[llm.LLMClient]) -> Tuple[bool, str]:
+    """For a model-review finding there is no analyzer to re-run; ask the model
+    to re-audit the patched region. Clearly labelled as a review, not a proof."""
+    if client is None:
+        return False, "no model to re-review the patched region"
+    text = util.read_text(os.path.join(tree, f.file))
+    lines = text.splitlines()
+    lo, hi = max(0, f.line - 40), min(len(lines), f.line + 60)
+    code = "\n".join("%4d  %s" % (i + 1, lines[i]) for i in range(lo, hi))
+    try:
+        resp = client.complete(_REREVIEW_PROMPT.format(cwe=f.cwe, title=f.cwe_name, line=f.line,
+                                                       why=f.message[:200], code=code),
+                               system="You are a precise application-security auditor.", max_tokens=200)
+    except llm.LLMUnavailable:
+        return False, "model unavailable for re-review"
+    verdict = resp.strip().split()[0].strip(".:,").upper() if resp.strip() else ""
+    if verdict.startswith("FIXED"):
+        return True, "model re-review: issue no longer present (review, not a proof)"
+    return False, "model re-review: " + resp.strip().splitlines()[0][:160]
 
 
 def g2_rescan(tree: str, f: SFinding, stacks: List[str], scanner_used: str) -> Tuple[bool, str]:
@@ -843,6 +1055,7 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
                   pr_bundle: Optional[Dict]) -> Dict:
     return {
         "id": f.id, "kind": "static", "signature": f.signature, "asan_class": "%s:%s" % (f.source, f.rule),
+        "review": f.source == "model-review",
         "cwe": f.cwe, "cwe_name": f.cwe_name, "severity": f.severity, "access": "static analysis",
         "crash_file": "%s:%d" % (f.file, f.line), "crash_func": f.func,
         "frames": [{"func": f.func, "file": f.file, "line": f.line, "in_target": True}],
@@ -863,7 +1076,8 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
 
 def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str = "critical",
         interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
-        publish=lambda: None, progress=None, deps: bool = False) -> Dict:
+        publish=lambda: None, progress=None, deps: bool = False, review: bool = True,
+        review_files_n: int = 8) -> Dict:
     root = task.root
     stacks = task.raw.get("stacks") or detect_stacks(root)
     t0 = time.time()
@@ -876,7 +1090,18 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
 
     util.stage("Discovery (static analysis)")
     found, note = discover(root, stacks, scanner, files, log=util.step)
-    scanner_used = "semgrep" if found and found[0].source == "semgrep" else "builtin"
+    scanner_used = "semgrep" if any(f.source == "semgrep" for f in found) else "builtin"
+    model = client if client.provider != "offline" else None
+    if review and model is not None:
+        util.stage("Model review (logic bugs: authorization, mass assignment, exposure, enumeration)")
+        rv = model_review(root, files, model, found, limit=review_files_n, log=util.step)
+        if rv:
+            found = sorted(found + rv, key=rank_key)
+            note += "; model review %d finding(s) (%s)" % (len(rv), client.model)
+        util.good("model review: %d finding(s) with verifiable evidence" % len(rv)) if rv else \
+            util.info("model review: nothing additional with verifiable evidence")
+    elif review:
+        util.info(util.dim("model review skipped (no model; add --provider ollama for logic-bug review)"))
     for i, f in enumerate(found):
         f.id = "KV-%s-%03d" % (task.name.upper()[:6].replace("-", ""), i + 1)
     util.good("%d unique finding(s) after dedupe (%s)" % (len(found), note)) if found else \
@@ -886,9 +1111,11 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
     if found:
         util.info("severity  : " + ", ".join("%s %d" % kv for kv in sorted(by_sev.items(), key=lambda kv: -cwemod.severity_rank(kv[0]))))
-    todo = found[:max_findings]
-    if len(found) > max_findings:
-        util.info(util.dim("repairing the top %d by severity; the rest are listed in the evidence" % max_findings))
+    todo = [f for f in found if patchable(f)][:max_findings] + [f for f in found if not patchable(f)]
+    n_patchable = sum(1 for f in found if patchable(f))
+    if n_patchable > max_findings:
+        util.info(util.dim("repairing the top %d patchable findings by severity; the rest are listed in the evidence"
+                           % max_findings))
 
     findings_out: List[Dict] = []
     if progress is not None:
@@ -920,7 +1147,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         mc = mechanical_fix(root, f)
         if mc:
             cands.append(mc)
-        cands += model_candidates(root, f, client if client.provider != "offline" else None)
+        cands += model_candidates(root, f, model)
         if not cands:
             why = ("no mechanical fix for this pattern and no model configured (add --provider)"
                    if client.provider == "offline" else "model returned no usable diff")
@@ -958,7 +1185,10 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             if ok:
                 ok, d = g1_syntax(tree, f.file); gates.append({"name": "G1 syntax", "passed": ok, "detail": d})
             if ok:
-                ok, d = g2_rescan(tree, f, stacks, scanner_used); gates.append({"name": "G2 re-scan", "passed": ok, "detail": d})
+                if f.source == "model-review":
+                    ok, d = g2_rereview(tree, f, model); gates.append({"name": "G2 re-review", "passed": ok, "detail": d})
+                else:
+                    ok, d = g2_rescan(tree, f, stacks, scanner_used); gates.append({"name": "G2 re-scan", "passed": ok, "detail": d})
             if ok:
                 if not tests_checked:
                     base_tests = run_tests(root, stacks); tests_checked = True
@@ -974,7 +1204,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                     ok = passed
             proof_path = None
             if ok:
-                res, d, proof_path = g4_proof(root, tree, f, c.diff, client if client.provider != "offline" else None, work_dir)
+                res, d, proof_path = g4_proof(root, tree, f, c.diff, model, work_dir)
                 gates.append({"name": "G4 proof test", "passed": res is not False,
                               "detail": d + ("" if res is not None else " (not claimed)")})
                 ok = res is not False
@@ -992,7 +1222,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             util.step("%-28s %s" % (c.label, c.status))
             validation = {"status": "Rejected", "gates": gates}
             # reflection: tell the model why, once
-            if c.source == "model" and client.provider != "offline" and len(cands) < 4:
+            if c.source == "model" and model is not None and len(cands) < 4:
                 more = model_candidates(root, f, client, prior_reason=c.status + ": " + gates[-1]["detail"])
                 for m in more[:1]:
                     m.label = "retry: " + m.label
@@ -1007,9 +1237,11 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         findings_out.append(_finding_dict(f, cands, chosen, validation, pr_bundle))
         publish()
 
-    for f in found[max_findings:]:
-        findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
-                                                        "detail": "beyond --max-findings; not attempted"}, None))
+    done_ids = {d["id"] for d in findings_out}
+    for f in found:
+        if f.id not in done_ids:
+            findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
+                                                            "detail": "beyond --max-findings; not attempted"}, None))
     shutil.rmtree(scratch, ignore_errors=True)
     metrics = {"unique_findings": len(found), "verified_patches": verified, "skipped_by_reviewer": skipped,
                "time_to_first_pov": ("%.1fs" % (time.time() - t0)) if found else "n/a",

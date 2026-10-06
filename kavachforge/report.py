@@ -131,7 +131,8 @@ def _finding_card(f: Dict) -> str:
     static = f.get("kind") == "static"
     lbl_site, lbl_pov, lbl_rep = (("Location", "Flagged code", "Analyzer finding") if static
                                   else ("Crash site", "Proof-of-vulnerability", "Sanitizer report"))
-    pov_line = ("rule: <code>%s</code>%s" % (_e(f.get("asan_class")),
+    pov_line = ("rule: <code>%s</code>%s%s" % (_e(f.get("asan_class")),
+                " &nbsp;&middot;&nbsp; <b style='color:#8a63d2'>model review — unverified by a tool</b>" if f.get("review") else "",
                 " &nbsp;&middot;&nbsp; <b style='color:#d9822b'>critical area — human approval</b>" if f.get("critical") else "")
                 if static else
                 "%d bytes &middot; sha256 <code>%s</code><br>repro: <code>%s</code>"
