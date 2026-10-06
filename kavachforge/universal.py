@@ -429,6 +429,9 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
     for f in found:
         if f.cwe in ("CWE-1357",):
             f.severity = "Low"            # supply-chain hygiene, not a code defect
+        if is_test_path(f.file) and f.severity in ("Critical", "High"):
+            f.severity = "Low"            # a credential/sink inside a test is a fixture, not production exposure
+            f.message = "[in test code] " + f.message
         prev = merged[-1] if merged else None
         if prev and prev.cwe == f.cwe and prev.file == f.file and prev.func == f.func \
                 and f.line - prev.end_line <= 12:
@@ -443,17 +446,26 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
     return sorted(merged, key=rank_key), note
 
 
+_TEST_PATH_RE = re.compile(r"(^|/)(tests?|spec|specs|__tests__|testdata|fixtures|mocks?)(/|$)|(_test|Test|\.spec|\.test)\.\w+$")
+
+
+def is_test_path(rel: str) -> bool:
+    return bool(_TEST_PATH_RE.search(rel))
+
+
 def rank_key(f: SFinding):
     lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
     code = 0 if lang not in ("", "yaml", "json") else 1      # code before config/CI
+    if is_test_path(f.file):
+        code = 2                                              # test fixtures last
     return (code, -cwemod.severity_rank(f.severity), f.file, f.line)
 
 
 def patchable(f: SFinding) -> bool:
-    """Findings that a code patch can address (secrets and config/CI hygiene
-    go to a human instead and must not consume repair slots)."""
+    """Findings that a code patch can address (secrets, config/CI hygiene and
+    test fixtures go to a human instead and must not consume repair slots)."""
     lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
-    return f.cwe != "CWE-798" and lang not in ("", "yaml", "json")
+    return f.cwe != "CWE-798" and lang not in ("", "yaml", "json") and not is_test_path(f.file)
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +526,32 @@ def review_files(root: str, files: List[str], limit: int = 8) -> List[str]:
     return [rel for _, rel, _ in scored[:limit]]
 
 
+def _handler_windows(lines: List[str], before: int = 12, after: int = 48, cap: int = 320) -> str:
+    """Show the model only the regions around request handlers (real line
+    numbers kept), not whole 1,000-line files: 3-5x fewer prompt tokens, and
+    the evidence check still maps back to the file."""
+    if len(lines) <= cap:
+        return "\n".join("%4d  %s" % (i + 1, l) for i, l in enumerate(lines))
+    hits = [i for i, l in enumerate(lines) if _HANDLER_HINT.search(l)]
+    spans: List[List[int]] = []
+    for h in hits:
+        lo, hi = max(0, h - before), min(len(lines), h + after)
+        if spans and lo <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], hi)
+        else:
+            spans.append([lo, hi])
+    out, total = [], 0
+    for lo, hi in spans:
+        if total >= cap:
+            break
+        hi = min(hi, lo + (cap - total))
+        if out:
+            out.append("      ...")
+        out += ["%4d  %s" % (i + 1, lines[i]) for i in range(lo, hi)]
+        total += hi - lo
+    return "\n".join(out) if out else "\n".join("%4d  %s" % (i + 1, l) for i, l in enumerate(lines[:cap]))
+
+
 def _parse_review(resp: str) -> List[dict]:
     """Parse the model's JSON array; if the answer was truncated or sloppy,
     salvage every complete object in it (small models run out of tokens)."""
@@ -548,11 +586,7 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
     for rel in review_files(root, files, limit):
         text = util.read_text(os.path.join(root, rel))
         lines = text.splitlines()
-        if len(lines) > 420:
-            lines_shown = lines[:420]
-        else:
-            lines_shown = lines
-        code = "\n".join("%4d  %s" % (i + 1, l) for i, l in enumerate(lines_shown))
+        code = _handler_windows(lines)
         try:
             resp = client.complete(_REVIEW_PROMPT.format(checklist=REVIEW_CHECKLIST, file=rel, code=code),
                                    system="You are a precise application-security auditor. JSON only.",
@@ -812,6 +846,7 @@ def _scratch_copy(root: str, dest: str) -> None:
 
 
 INSTALLERS = {
+    "java": ["./gradlew", "compileJava", "-q", "--no-daemon"],      # warms the dependency cache
     "node": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--silent"],
     "python": [sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "-r", "requirements.txt"],
 }
@@ -824,6 +859,11 @@ def install_deps(root: str, stacks: List[str], log=lambda m: None, timeout: int 
             continue
         if s == "python" and not os.path.exists(os.path.join(root, "requirements.txt")):
             continue
+        if s == "java":
+            if os.path.exists(os.path.join(root, "pom.xml")) and shutil.which("mvn"):
+                cmd = ["mvn", "-q", "compile"]
+            elif not os.path.exists(os.path.join(root, "gradlew")):
+                continue
         if s == "node" and os.path.isdir(os.path.join(root, "node_modules")):
             return "node dependencies already installed"
         log("installing %s dependencies (%s) ..." % (s, " ".join(cmd[:2])))
@@ -856,9 +896,95 @@ SYNTAX_CHECK = {
 }
 
 
-def g1_syntax(tree: str, rel: str) -> Tuple[bool, str]:
+_JAVAC_PARSE_ERR = re.compile(r"error: (?:';' expected|illegal start of|reached end of file|not a statement|"
+                              r"unclosed|class, interface, enum, or record expected|<identifier> expected|"
+                              r"'\)' expected|'\{' expected|'\}' expected|orphaned|else without if|"
+                              r"missing return statement|unbalanced|invalid method declaration)")
+
+
+def _balanced(text: str) -> Optional[str]:
+    """Cheap parse sanity for languages without a local checker: brackets
+    must balance outside strings/comments."""
+    depth = {"(": 0, "[": 0, "{": 0}
+    pairs = {")": "(", "]": "[", "}": "{"}
+    i, n, in_str, in_line, in_block = 0, len(text), "", False, False
+    while i < n:
+        c = text[i]
+        if in_line:
+            in_line = c != "\n"
+        elif in_block:
+            if text.startswith("*/", i):
+                in_block = False; i += 1
+        elif in_str:
+            if c == "\\":
+                i += 1
+            elif c == in_str:
+                in_str = ""
+        elif text.startswith("//", i) or text.startswith("#", i) and "python" in text[:0]:
+            in_line = True
+        elif text.startswith("/*", i):
+            in_block = True; i += 1
+        elif c in "\"'`":
+            in_str = c
+        elif c in depth:
+            depth[c] += 1
+        elif c in pairs:
+            depth[pairs[c]] -= 1
+            if depth[pairs[c]] < 0:
+                return "unbalanced '%s'" % c
+        i += 1
+    bad = [k for k, v in depth.items() if v != 0]
+    return ("unbalanced '%s'" % bad[0]) if bad else None
+
+
+_PROJECT_COMPILE: Dict[str, Optional[List[str]]] = {}
+
+
+def project_compile_cmd(root: str) -> Optional[List[str]]:
+    """A real compile command for JVM projects, if the project's own build
+    tool can compile the UNPATCHED tree here (deps cached, right JDK).
+    Probed once per run; None means fall back to parse-level checks."""
+    if root in _PROJECT_COMPILE:
+        return _PROJECT_COMPILE[root]
+    cmd = None
+    cands = []
+    if os.path.exists(os.path.join(root, "gradlew")):
+        cands.append(["./gradlew", "compileJava", "--offline", "-q", "--no-daemon"])
+    if os.path.exists(os.path.join(root, "pom.xml")) and shutil.which("mvn"):
+        cands.append(["mvn", "-q", "-o", "compile"])
+    for c in cands:
+        r = util.run(c, cwd=root, timeout=420)
+        if r.ok:
+            cmd = c; break
+    _PROJECT_COMPILE[root] = cmd
+    return cmd
+
+
+def g1_syntax(tree: str, rel: str, root: Optional[str] = None) -> Tuple[bool, str]:
     lang = EXT_LANG.get(os.path.splitext(rel)[1], "")
     mk = SYNTAX_CHECK.get(lang)
+    if lang in ("java", "kotlin", "csharp", "scala", "swift", "typescript") and not mk:
+        if lang in ("java", "kotlin") and root:
+            pc = project_compile_cmd(root)
+            if pc:
+                r = util.run(pc, cwd=tree, timeout=600)
+                if r.ok:
+                    return True, "%s: project compiles" % pc[0]
+                err = [l for l in (r.err + r.out).splitlines() if "error:" in l or "error" in l.lower()][:1]
+                return False, "%s: %s" % (pc[0], (err[0] if err else "compile failed")[-200:])
+        if lang == "java" and shutil.which("javac"):
+            # parse-level errors only: unresolved imports are expected without the classpath
+            tmp = tempfile.mkdtemp(prefix="kv_javac_")
+            r = util.run(["javac", "-proc:none", "-d", tmp, os.path.join(tree, rel)], timeout=90)
+            shutil.rmtree(tmp, ignore_errors=True)
+            if r.ok:
+                return True, "javac: ok"
+            m = _JAVAC_PARSE_ERR.search(r.err)
+            if m:
+                return False, "javac: " + m.group(0)[7:]
+            return True, "javac: parses (symbol resolution skipped without the project classpath)"
+        why = _balanced(util.read_text(os.path.join(tree, rel)))
+        return (False, why) if why else (True, "brackets balance (no %s parser here)" % lang)
     if not mk:
         return True, "no syntax checker for %s here (not checked)" % (lang or "this file type")
     cmd = mk(os.path.join(tree, rel))
@@ -919,7 +1045,8 @@ TEST_RUNNERS = {
     "node": ("npm", ["npm", "test", "--silent"], "node_modules"),
     "python": ("pytest", [sys.executable, "-m", "pytest", "-q", "-x", "--timeout=60"], None),
     "go": ("go", ["go", "test", "./..."], None),
-    "java": ("mvn", ["mvn", "-q", "-o", "test"], None),
+    "java": ("mvn", ["mvn", "-q", "-o", "test"], "pom.xml"),
+    "gradle": ("gradle", ["./gradlew", "test", "--offline", "-q"], "gradlew"),
     "rust": ("cargo", ["cargo", "test", "--offline", "-q"], None),
     "php": ("phpunit", ["vendor/bin/phpunit"], "vendor"),
     "ruby": ("bundle", ["bundle", "exec", "rake", "test"], None),
@@ -928,14 +1055,22 @@ TEST_RUNNERS = {
 
 def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optional[bool], str]:
     """None = could not run here (honest skip); else pass/fail + summary line."""
-    for s in stacks:
+    order = list(stacks)
+    if "java" in order and os.path.exists(os.path.join(tree, "gradlew")):
+        order.insert(order.index("java"), "gradle")
+    for s in order:
         if s not in TEST_RUNNERS:
             continue
         tool, cmd, needs = TEST_RUNNERS[s]
-        if shutil.which(cmd[0]) is None:
-            return None, "%s not installed" % tool
-        if needs and not os.path.isdir(os.path.join(tree, needs)):
+        if needs and not os.path.exists(os.path.join(tree, needs)):
+            if s in ("java", "gradle"):
+                continue                      # try the other build tool
             return None, "%s dependencies not installed (%s/ missing) - suite cannot run offline" % (s, needs)
+        if cmd[0].startswith("./"):
+            if not os.access(os.path.join(tree, cmd[0]), os.X_OK):
+                return None, "%s not executable" % cmd[0]
+        elif shutil.which(cmd[0]) is None:
+            return None, "%s not installed" % tool
         if s == "node":
             try:
                 pj = json.load(open(os.path.join(tree, "package.json")))
@@ -952,7 +1087,9 @@ def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optiona
         if r.code == 5 or "no tests ran" in blob:
             return None, "no tests collected"
         if re.search(r"No module named (pytest|unittest)|command not found|ENOENT|Cannot find module|"
-                     r"ECONNREFUSED|MongoNetworkError|connect ECONNREFUSED|could not connect", blob):
+                     r"ECONNREFUSED|MongoNetworkError|connect ECONNREFUSED|could not connect|"
+                     r"MissingProjectException|Could not resolve|offline mode|Unable to resolve|"
+                     r"Plugin .* not found|No such file or directory", blob):
             return None, "suite cannot run here: " + tail
         return r.ok, tail
     return None, "no recognised test runner for %s" % ", ".join(stacks)
@@ -1183,7 +1320,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             _scratch_copy(root, tree)
             ok, d = g0_apply(tree, c.diff); gates.append({"name": "G0 patch applies", "passed": ok, "detail": d})
             if ok:
-                ok, d = g1_syntax(tree, f.file); gates.append({"name": "G1 syntax", "passed": ok, "detail": d})
+                ok, d = g1_syntax(tree, f.file, root); gates.append({"name": "G1 syntax", "passed": ok, "detail": d})
             if ok:
                 if f.source == "model-review":
                     ok, d = g2_rereview(tree, f, model); gates.append({"name": "G2 re-review", "passed": ok, "detail": d})

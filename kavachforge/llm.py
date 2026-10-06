@@ -124,12 +124,20 @@ class LLMClient:
         if self.calls >= self.budget:
             raise LLMUnavailable("LLM budget of %d calls exhausted" % self.budget)
 
-        try:
-            text = self._call_live(prompt, system, max_tokens)
-        except (urllib.error.URLError, urllib.error.HTTPError, OSError,
-                KeyError, ValueError, TimeoutError) as e:
-            self._log(system, prompt, "ERROR: %s" % e, "error")
-            raise LLMUnavailable("transport error: %s" % e)
+        attempts = 3 if self.provider == "ollama" else 1   # a local runner can be
+        last = None                                         # restarting (OOM/reload)
+        for i in range(attempts):
+            try:
+                text = self._call_live(prompt, system, max_tokens)
+                break
+            except (urllib.error.URLError, urllib.error.HTTPError, OSError,
+                    KeyError, ValueError, TimeoutError) as e:
+                last = e
+                if i + 1 < attempts:
+                    time.sleep(8 * (i + 1))
+                    continue
+                self._log(system, prompt, "ERROR: %s" % e, "error")
+                raise LLMUnavailable("transport error: %s" % e)
 
         self.calls += 1
         self.last_source = "live"
