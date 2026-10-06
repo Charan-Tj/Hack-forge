@@ -159,7 +159,7 @@ class _NoToolchain:
 
 def run_universal(task, work_dir: str, client, approve: str = "critical",
                   interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
-                  deps: bool = False) -> Dict:
+                  deps: bool = False, review: bool = True) -> Dict:
     """Any-stack track: static discovery -> repair ensemble -> approval -> gates."""
     from . import universal
     P = _Progress(task, _NoToolchain(), client, work_dir, stages=STAGES_UNIVERSAL)
@@ -170,7 +170,7 @@ def run_universal(task, work_dir: str, client, approve: str = "critical",
         P.set("risk", "running")
         res = universal.run(task, client, work_dir, approve=approve, interactive=interactive,
                             scanner=scanner, max_findings=max_findings, publish=P.publish, progress=P,
-                            deps=deps)
+                            deps=deps, review=review)
         P.ledger = res["risk_ledger"]
         P.disc_stats = res["discovery"]
         P.findings = res["findings"]
@@ -211,7 +211,7 @@ def run_task(task_path: str, out_root: str = "artifacts",
              uplift: bool = False, diff: Optional[str] = None,
              sarif: Optional[str] = None, approve: str = "critical",
              interactive: bool = True, scanner: str = "auto",
-             max_findings: int = 12, deps: bool = False) -> Dict:
+             max_findings: int = 12, deps: bool = False, review: bool = True) -> Dict:
     task = config.load_task(task_path, diff_override=diff, sarif_override=sarif)
     work_dir = os.path.join(out_root, task.name)
     os.makedirs(work_dir, exist_ok=True)
@@ -224,8 +224,10 @@ def run_task(task_path: str, out_root: str = "artifacts",
     if task.kind == "universal":
         client = llm.LLMClient(provider=provider, model=model, budget=budget,
                                cache_dir="cache/llm", log_dir=os.path.join(work_dir, "llm_log"))
+        if client.provider == "ollama" and budget <= 6:
+            client.budget = 40          # a local model is free: review + repair need more than 6 calls
         return run_universal(task, work_dir, client, approve=approve, interactive=interactive,
-                             scanner=scanner, max_findings=max_findings, deps=deps)
+                             scanner=scanner, max_findings=max_findings, deps=deps, review=review)
 
     tc = toolchain.detect(engine_pref)
     client = llm.LLMClient(provider=provider, model=model, budget=budget,

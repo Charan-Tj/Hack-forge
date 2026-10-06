@@ -72,8 +72,10 @@ class LLMClient:
         if self.provider == "ollama" and not model and not os.environ.get("KAVACH_LLM_MODEL"):
             have = ollama_models()
             if have and not any(h.split(":")[0] == self.model.split(":")[0] for h in have):
-                pref = [h for h in have if "coder" in h or "qwen" in h or "devstral" in h or "deepseek" in h]
-                self.model = (pref or have)[0]
+                order = ["gpt-oss", "devstral", "gemma3", "phi4", "granite", "qwen2.5-coder", "qwen3",
+                         "deepseek-coder", "llama3.1", "llama3.3", "mistral", "llama"]
+                ranked = sorted(have, key=lambda h: next((i for i, k in enumerate(order) if h.startswith(k)), 99))
+                self.model = ranked[0]
         self.budget = int(os.environ.get("KAVACH_LLM_BUDGET", budget))
         self.cache_dir = cache_dir
         self.log_dir = log_dir

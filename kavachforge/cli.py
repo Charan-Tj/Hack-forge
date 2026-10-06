@@ -41,7 +41,8 @@ def _common_kwargs(args, provider=None):
                 interactive=not getattr(args, "yes", False),
                 scanner=getattr(args, "scanner", "auto"),
                 max_findings=getattr(args, "max_findings", 12),
-                deps=getattr(args, "deps", False))
+                deps=getattr(args, "deps", False),
+                review=not getattr(args, "no_review", False))
 
 
 def _run_many(names, args, provider=None, on_each=None) -> int:
@@ -460,6 +461,8 @@ def main(argv=None) -> int:
         sp.add_argument("--scanner", choices=["auto", "semgrep", "builtin"], default="auto",
                         help="universal track analyzer")
         sp.add_argument("--max-findings", type=int, default=12, help="universal track: repair at most N")
+        sp.add_argument("--no-review", action="store_true",
+                        help="universal track: skip the model's semantic review of handlers")
         sp.add_argument("--deps", action="store_true",
                         help="universal track: install the repo's dependencies first (npm ci / pip -r) "
                              "so its test suite can run as gate G3")
