@@ -405,7 +405,7 @@ def _cmd_prefetch(args) -> int:
     else:
         util.warn("semgrep not installed (pip install semgrep); built-in rules will be used"); rc = 1
     if shutil.which("ollama"):
-        model = args.model or "qwen2.5-coder:7b"
+        model = args.model or "gpt-oss:20b"
         have = llm.ollama_models()
         if any(h == model or h.split(":")[0] == model.split(":")[0] for h in have):
             util.good("ollama model present: %s" % model)
@@ -544,7 +544,7 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("prefetch", help="cache semgrep rule packs + pull the local model so "
                         "everything runs offline later")
-    sp.add_argument("--model", default=None, help="ollama model to pull (default qwen2.5-coder:7b)")
+    sp.add_argument("--model", default=None, help="ollama model to pull (default gpt-oss:20b; 24 GB+: devstral-small-2:24b)")
     sp.set_defaults(func=_cmd_prefetch)
 
     sp = sub.add_parser("ci", help="pull-request check: run on changed targets, "

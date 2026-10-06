@@ -33,7 +33,7 @@ class LLMUnavailable(Exception):
 DEFAULT_MODELS = {
     "anthropic": "claude-3-5-sonnet-20241022",
     "openai": "gpt-4o-mini",
-    "ollama": "qwen2.5-coder:7b",
+    "ollama": "devstral-small-2:24b",
 }
 
 
@@ -72,8 +72,10 @@ class LLMClient:
         if self.provider == "ollama" and not model and not os.environ.get("KAVACH_LLM_MODEL"):
             have = ollama_models()
             if have and not any(h.split(":")[0] == self.model.split(":")[0] for h in have):
-                order = ["gpt-oss", "devstral", "gemma3", "phi4", "granite", "qwen2.5-coder", "qwen3",
-                         "deepseek-coder", "llama3.1", "llama3.3", "mistral", "llama"]
+                # evidence-ranked (docs/OFFLINE_MODELS.md): repair quality first, then review quality
+                order = ["devstral-small-2", "gpt-oss", "devstral", "gemma4", "phi4-reasoning", "phi4",
+                         "granite4", "gemma3", "granite", "qwen3.6", "qwen3-coder", "qwen2.5-coder", "qwen3",
+                         "deepseek-coder", "llama3.3", "llama3.1", "mistral", "llama"]
                 ranked = sorted(have, key=lambda h: next((i for i, k in enumerate(order) if h.startswith(k)), 99))
                 self.model = ranked[0]
         self.budget = int(os.environ.get("KAVACH_LLM_BUDGET", budget))
@@ -191,7 +193,7 @@ class LLMClient:
                 {"content-type": "application/json"},
                 {"model": self.model, "stream": False,
                  "options": {"temperature": 0, "num_predict": max_tokens,
-                             "num_ctx": int(os.environ.get("KAVACH_OLLAMA_CTX", "8192"))},
+                             "num_ctx": int(os.environ.get("KAVACH_OLLAMA_CTX", "16384"))},
                  "messages": [{"role": "system", "content":
                                system or "You are a precise security engineer."},
                               {"role": "user", "content": prompt}]},

@@ -17,7 +17,7 @@ pip install semgrep                                   # any OS; pure pip
 # 3. cache everything KavachForge will need
 ./kavach prefetch                                     # rule packs -> rules/semgrep/ (15 ship in the repo;
                                                       #   p/secrets is fetched here), pulls qwen2.5-coder:7b
-./kavach prefetch --model qwen2.5-coder:14b           # bigger model if the laptop can take it (see table)
+./kavach prefetch --model devstral-small-2:24b         # 24 GB+ laptop (see §2b)
 
 # 4. verify
 ./kavach doctor                                       # must show: semgrep + packs cached, ollama + model
@@ -63,24 +63,32 @@ What we observed with `qwen2.5-coder:7b` on a 2-core cloud CPU (worst case):
 - Mechanical hardening (cookie flags, `yaml.safe_load`, `verify=True`, `InsecureSkipVerify`)
   needs no model at all.
 
-## 2b. If Chinese-origin models are not allowed
+## 2b. Recommended models (research-backed, non-Chinese) — read this first
 
-Same prompts, same gates; pick by RAM. All of these are in the Ollama library (`ollama pull <name>`).
+Full evidence in `reports/Best local models for bug finding.md`. Same prompts, same gates; pick by RAM.
+All figures are vendor-reported SWE-bench Verified unless marked; no public benchmark covers
+vulnerability repair for these exact models, so rehearse once on VAmPI/NodeGoat.
 
-| laptop | pull | origin / licence | notes |
+| laptop | pull | origin / licence | why |
 |---|---|---|---|
-| 16 GB | **`gemma3:12b`** (8 GB) | Google, US · Gemma licence | best code quality that fits 16 GB comfortably |
-| 16 GB | `phi4:14b` (9 GB) | Microsoft, US · MIT | strong reasoning for the review stage, a little slower |
-| 16 GB | `granite3.3:8b` (5 GB) | IBM, US · Apache-2.0 | enterprise-clean licence |
-| 24–32 GB | **`gpt-oss:20b`** (13 GB) | OpenAI, US · Apache-2.0 | open-weight MoE, fast on Apple Silicon, best overall |
-| 24–32 GB | `devstral:24b` (14 GB) | Mistral, France · Apache-2.0 | built for agentic code edits |
-| any | `llama3.1:8b` (5 GB) | Meta, US · Llama licence | fallback |
+| 24–32 GB | **`devstral-small-2:24b`** (15 GB) | Mistral, France · Apache-2.0 | best open non-Chinese repair score (65.8–68% SWE-bench Verified); built for agentic code edits |
+| 24–32 GB | `gpt-oss:20b` (14 GB) | OpenAI, USA · Apache-2.0 | 60.7% at `reasoning: high`; strong structured output → good reviewer / second strategy |
+| 16 GB | **`gpt-oss:20b`** (14 GB, MoE, 3.6B active) | OpenAI, USA · Apache-2.0 | the only repair-capable model that fits; keep `KAVACH_OLLAMA_CTX=8192` |
+| 16 GB | `gemma4:12b` / `gemma3:12b` (8 GB) | Google, USA · Apache-2.0 / Gemma licence | triage + review; weaker at multi-step edits (independent agentic test: 17%) |
+| 16 GB | `phi4-reasoning:14b` (9–11 GB) | Microsoft, USA · MIT | review stage reasoning |
+| any | `granite4.2:8b` / `granite3.3:8b` (5 GB) | IBM, USA · Apache-2.0 | enterprise-clean fallback |
 
-Avoid `codestral` (non-commercial licence). When several models are installed and none is named,
-KavachForge picks in this order: gpt-oss, devstral, gemma3, phi4, granite, qwen2.5-coder, …
-Set `KAVACH_LLM_MODEL=<name>` or pass `--model <name>` to force one. Run VAmPI once with the
-chosen model before the demo — the pipeline was validated with qwen2.5-coder:7b; other models go
-through the same gates, which is what protects the demo from a weaker edit.
+Security-tuned models (Cisco Foundation-Sec-8B, Trend Micro Primus, Kindo WhiteRabbitNeo, IBM
+CyberPal 2.0) publish gains only on threat-intel / CVE→CWE exams, none on code repair, and IBM's
+own tuning *lowered* secure-code scores — so they are not used for patching. Optionally
+`ollama run hf.co/fdtn-ai/Foundation-Sec-8B-Reasoning-Q8_0-GGUF` for CWE narration only.
+WhiteRabbitNeo 2.5/V3 and CyberPal 4B–14B are Qwen fine-tunes (Chinese base).
+
+For reference, the excluded Chinese leader is Qwen3.6-27B (77.2%); the exclusion costs ~10 points.
+Avoid `codestral` (non-commercial licence). Auto-pick order when several models are installed:
+devstral-small-2 → gpt-oss → gemma4 → phi4-reasoning → granite4 → …; force with `--model` or
+`KAVACH_LLM_MODEL`. Context is set to 16K by default (`KAVACH_OLLAMA_CTX`) — Ollama's 2K default
+roughly halves edit success on 32B-class models.
 
 ## 3. Without Ollama at all
 
