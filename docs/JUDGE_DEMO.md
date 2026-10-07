@@ -212,6 +212,16 @@ cat  artifacts/final/report.csv         # same rows, CSV
 ls   artifacts/final/pr/*/fix.patch     # verified patches to apply over SSH, then run restart.sh
 ```
 
+**Scoring-aware by design (modelled on DARPA AIxCC):** AIxCC paid 1–2 pts per PoV, 3–6 per
+patch, −7 for wrong bundles, halved late submissions, and applied a non-linear accuracy
+multiplier (50% accuracy → −6%, 40% → −13%). KavachForge therefore gives every finding a
+**confidence** (semgrep rule confidence tag, per-pattern prior, model opinion base), adjusts it
+with evidence (repeated sink, high-impact class, verified patch +0.25; test/static path or
+"secure" variant −0.3), asks the model for a **second opinion** on borderline findings (a REAL
+verdict only counts if it cites real lines), and submits only above the `--precision` threshold
+(strict 0.7 / balanced 0.5 / recall 0.3). `report.md`/`.csv` are rewritten at every stage so
+you can submit early. Say to the judges: "we would rather report 6 true bugs than 20 maybes".
+
 What protects the score:
 - `--deadline-min` stops new findings and model calls at the limit; evidence, dashboard,
   `report.md` and `report.csv` are written even on an error or Ctrl-C.
