@@ -240,7 +240,8 @@ def run_semgrep(root: str, stacks: List[str], paths: Optional[List[str]] = None,
     `kavach prefetch` has stored it (offline), else the registry."""
     cfgs = configs or packs_for(stacks)
     out = tempfile.mktemp(prefix="kv_sg_", suffix=".sarif")
-    cmd = ["semgrep", "--sarif", "--quiet", "--metrics=off", "--timeout", "30", "-o", out]
+    cmd = ["semgrep", "--sarif", "--quiet", "--metrics=off", "--timeout", "30",
+           "-j", str(max(1, min(8, os.cpu_count() or 1))), "-o", out]
     local = 0
     for c in cfgs:
         lp = pack_path(c)
@@ -253,6 +254,8 @@ def run_semgrep(root: str, stacks: List[str], paths: Optional[List[str]] = None,
     cmd += (paths or ["."])
     r = util.run(cmd, cwd=root, timeout=timeout)
     if not os.path.exists(out):
+        if r.seconds >= timeout - 1:
+            return None, "semgrep stopped after %ds (its slot of the window)" % timeout
         return None, "semgrep failed: " + (r.err.strip().splitlines() or ["?"])[-1][-200:]
     try:
         d = json.load(open(out))
@@ -462,12 +465,14 @@ def run_builtin(root: str, files: List[str]) -> List[SFinding]:
 
 
 def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optional[List[str]] = None,
-             log=lambda m: None) -> Tuple[List[SFinding], str]:
+             log=lambda m: None, sg_timeout: int = 600) -> Tuple[List[SFinding], str]:
     files = files or source_files(root)
     note = ""
     found: List[SFinding] = []
     if scanner in ("auto", "semgrep") and semgrep_available():
-        sarif, note = run_semgrep(root, stacks)
+        log("semgrep: scanning %d file(s) with cached rule packs… (up to %ds, then built-in rules only)"
+            % (len(files), sg_timeout))
+        sarif, note = run_semgrep(root, stacks, timeout=sg_timeout)
         if sarif is not None:
             found = findings_from_sarif(root, sarif, "SG")
             log("semgrep: %d result(s) (%s)" % (len(found), note))
@@ -526,7 +531,8 @@ _COMMENT_RE = re.compile(r"^\s*(//|#|/\*|\*|<!--|--)")
 # earn half. So: submit only what clears a confidence bar, confirm borderline
 # findings with a second opinion, and keep the report current at all times.
 PRECISION_THRESHOLD = {"strict": 0.7, "balanced": 0.5, "recall": 0.3}
-REVIEW_SHARE = 0.35      # at most this share of the deadline goes to the review stage; the rest to repair
+REVIEW_SHARE = 0.35      # at most this share of the deadline goes to the review stage
+PRE_REPAIR_SHARE = 0.50  # review + second opinion must be over by here: repair keeps >= half the window
 
 _CONFIRM_PROMPT = """You are the second reviewer in a bug-bounty triage. A scanner flagged the code below.
 Decide whether this is a REAL, reachable weakness in this application (attacker-influenced data can reach
@@ -557,7 +563,7 @@ def confirm_finding(root: str, f: SFinding, client: Optional[llm.LLMClient]) -> 
     try:
         resp = client.complete(_CONFIRM_PROMPT.format(cwe=f.cwe, title=f.cwe_name, file=f.file, line=f.line,
                                                       why=f.message[:200], evidence=ev[:160], code=code),
-                               system="You are a precise, sceptical application-security reviewer.", max_tokens=160)
+                               system="You are a precise, sceptical application-security reviewer.", max_tokens=160, kind="confirm")
     except llm.LLMUnavailable as e:
         return None, str(e)
     head = resp.strip().split("\n", 1)
@@ -576,7 +582,8 @@ def confirm_finding(root: str, f: SFinding, client: Optional[llm.LLMClient]) -> 
 
 
 def apply_scoring(found: List[SFinding], root: str, client: Optional[llm.LLMClient], mode: str,
-                  log=lambda m: None, max_confirm: int = 8) -> None:
+                  log=lambda m: None, max_confirm: int = 8, stop_at: Optional[float] = None,
+                  repair_first: int = 0) -> None:
     """Compute final confidence and the SUBMIT/HOLD decision for each finding."""
     thr = PRECISION_THRESHOLD.get(mode, 0.5)
     # cheap evidence adjustments
@@ -595,8 +602,17 @@ def apply_scoring(found: List[SFinding], root: str, client: Optional[llm.LLMClie
     # second opinion on borderline, otherwise-submittable findings
     if client is not None:
         border = [f for f in found if not f.hold and thr - 0.2 <= f.confidence < thr + 0.15]
-        border.sort(key=lambda f: -cwemod.severity_rank(f.severity))
-        for f in border[:max_confirm]:
+        # the ones we will try to patch matter most (they decide the repair slots), then by severity
+        top = {id(f) for f in [x for x in found if patchable(x) and not x.hold][:repair_first]}
+        border.sort(key=lambda f: (0 if id(f) in top else 1, -cwemod.severity_rank(f.severity)))
+        todo = border[:max_confirm]
+        if todo:
+            log("second opinion: asking %s about %d borderline finding(s)… (one call each)" % (client.model, len(todo)))
+        for n, f in enumerate(todo):
+            if stop_at and time.time() + client.avg_call(kind="confirm") > stop_at:
+                log("second opinion stopped after %d (model answers in ~%.0fs; repair keeps its half of the window) - "
+                    "%d finding(s) keep their static confidence" % (n, client.avg_call(kind="confirm"), len(todo) - n))
+                break
             v, just = confirm_finding(root, f, client)
             if v is True:
                 f.confidence = min(1.0, f.confidence + 0.2); f.conf_why += "; + second opinion: REAL (%s)" % just[:80]
@@ -671,7 +687,7 @@ Report ONLY issues you can point to in this file. For each, cite the line number
 substring of that line as `evidence` (this is checked mechanically; an issue whose evidence is not on
 that line is discarded). Be precise, not exhaustive: skip style issues and anything speculative.
 
-Report at most 6 issues, most severe first. Answer with a JSON array only, no prose:
+Report at most 4 issues, most severe first. Answer with a JSON array only, no prose:
 [{{"line": <int>, "function": "<name>", "cwe": "CWE-<n>", "title": "<short>", "severity": "High|Medium|Low",
   "evidence": "<exact substring of that line>", "why": "<one sentence>", "fix": "<one sentence>"}}]
 Return [] if there is nothing.
@@ -757,17 +773,22 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
         return []
     out: List[SFinding] = []
     have = {(f.cwe, f.file) : f for f in existing}
-    for rel in review_files(root, files, limit):
-        if stop_at and time.time() > stop_at:
-            log("review budget used (%.0f%% of the deadline) - moving on to repair" % (REVIEW_SHARE * 100))
+    todo = review_files(root, files, limit)
+    for n, rel in enumerate(todo, 1):
+        # stop when the NEXT call (at the model's measured speed) would overrun the slot
+        if stop_at and time.time() + client.avg_call(kind="review") > stop_at:
+            log("review slot used (%.0f%% of the deadline; this model answers in ~%.0fs) - "
+                "%d file(s) left unreviewed to protect repair time"
+                % (REVIEW_SHARE * 100, client.avg_call(kind="review"), len(todo) - n + 1))
             break
         text = util.read_text(os.path.join(root, rel))
         lines = text.splitlines()
         code = _handler_windows(lines)
+        log("review %d/%d %s … asking %s" % (n, len(todo), rel, client.model))
         try:
             resp = client.complete(_REVIEW_PROMPT.format(checklist=REVIEW_CHECKLIST, file=rel, code=code),
                                    system="You are a precise application-security auditor. JSON only.",
-                                   max_tokens=2000)
+                                   max_tokens=1200, kind="review")
         except llm.LLMUnavailable as e:
             util.warn("model review stopped: %s" % e)
             break
@@ -861,8 +882,10 @@ def check_policy(f: SFinding, diff: str) -> Optional[str]:
     if removed and not added:
         return "patch only deletes code; a fix must validate, encode or replace the unsafe call"
     joined = "\n".join(added)
-    if re.search(r"\beval\s*\(|\bnew\s+Function\s*\(|child_process|os\.system|shell\s*=\s*True|\$where", joined):
-        return "patch introduces a new dangerous code or command execution primitive"
+    m = re.search(r"\beval\s*\(|\bnew\s+Function\s*\(|child_process|os\.system|shell\s*=\s*True|\$where", joined)
+    if m:
+        return ("patch still uses the dangerous primitive %r - the fix must remove it entirely "
+                "(use a plain query operator / parameterized call instead)" % m.group(0).strip())
     if re.search(r"\b(?:app|router|express)\s*\.\s*(?:get|post|put|delete|use)\s*\(\s*['\"`]", joined):
         return "patch adds a new HTTP route"
     if re.search(r"(?:http\s*\.\s*request|https\s*\.\s*request|\bfetch\s*\(|\baxios\s*\.)", joined):
@@ -882,8 +905,11 @@ Analyzer message: {message}
 {hint}
 File: {file}  (lines {line}-{end_line} are the flagged location)
 
-Give TWO alternative fixes. Each fix is one or more SEARCH/REPLACE edits. SEARCH must copy the
-existing lines EXACTLY (same indentation, no line numbers); REPLACE is the new text. Format exactly:
+Give TWO alternative fixes. Each fix is one or more SEARCH/REPLACE edits. SEARCH must copy WHOLE
+existing lines EXACTLY as they appear (full line from first character to last, same indentation,
+every prefix such as f"..." kept, no line numbers); REPLACE is the complete new text for those lines.
+A fix must be complete: if you change a query/command to a parameterized form, also change the call
+that executes it so the parameters are actually passed. Format exactly:
 
 ### STRATEGY: <short name>
 <<<<<<< SEARCH
@@ -949,6 +975,11 @@ def _apply_search_replace(original: str, blocks: List[Tuple[str, str]]) -> Optio
             if window == s_lines:
                 hit = i; break
         if hit is None:
+            # sub-line match: a single-line SEARCH that is a fragment of exactly
+            # one line (models often drop a prefix such as the f in f"...")
+            if "\n" not in search.strip() and "\n" not in replace.strip() and text.count(search.strip()) == 1:
+                text = text.replace(search.strip(), replace.strip(), 1)
+                continue
             return None
         indent = re.match(r"\s*", src_lines[hit]).group(0)
         rep_lines = replace.splitlines()
@@ -1003,9 +1034,12 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
         prompt += ("\nSTRICT FORMAT RETRY: return exactly one SEARCH/REPLACE block using this concrete shape; "
                    "copy the existing line exactly and do not return a unified diff or prose:\n"
                    "<<<<<<< SEARCH\nold code exactly as shown\n=======\nnew code\n>>>>>>> REPLACE\n")
+    util.step("asking %s for a patch%s … (this is the slow step on CPU)"
+              % (client.model, " (retry after rejection)" if prior_reason else ""))
+    t0 = time.time()
     try:
         resp = client.complete(prompt, system="You are a careful application-security engineer. "
-                                              "You answer only in the requested edit format.", max_tokens=1800)
+                                              "You answer only in the requested edit format.", max_tokens=1800, kind="patch")
     except llm.LLMUnavailable as e:
         util.warn("model unavailable for repair: %s" % e)
         return []
@@ -1028,6 +1062,7 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
             out.append(c)
     if not out and raw_path:
         util.write_text(raw_path, resp)
+    util.step("model answered in %.0fs: %d usable candidate(s)" % (time.time() - t0, len(out)))
     return out[:3]
 
 
@@ -1773,13 +1808,23 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         util.info("deps      : " + install_deps(root, stacks, log=util.step))
 
     util.stage("Discovery (static analysis)")
-    found, note = discover(root, stacks, scanner, files, log=util.step)
+    # semgrep gets at most a quarter of the window (never under 2 min); past that the
+    # 36 built-in patterns carry discovery so review and repair still get their slots
+    sg_timeout = int(max(120, min(600, 0.25 * (deadline - t0)))) if deadline else 600
+    found, note = discover(root, stacks, scanner, files, log=util.step, sg_timeout=sg_timeout)
     scanner_used = "semgrep" if any(f.source == "semgrep" for f in found) else "builtin"
     model = client if client.provider != "offline" else None
     if review and model is not None:
         util.stage("Model review (logic bugs: authorization, mass assignment, exposure, enumeration)")
-        rv = model_review(root, files, model, found, limit=review_files_n, log=util.step,
-                          stop_at=(t0 + REVIEW_SHARE * (deadline - t0)) if deadline else None)
+        review_end = (t0 + REVIEW_SHARE * (deadline - t0)) if deadline else None
+        if review_end and time.time() > review_end - 30:
+            util.info("review skipped: static discovery already used the review slot (%.0fs); going straight to scoring + repair"
+                      % (time.time() - t0))
+            rv = []
+        else:
+            client.slot_end = review_end      # one call can never overrun the slot
+            rv = model_review(root, files, model, found, limit=review_files_n, log=util.step, stop_at=review_end)
+            client.slot_end = None
         if rv:
             found = sorted(found + rv, key=rank_key)
             note += "; model review %d finding(s) (%s)" % (len(rv), client.model)
@@ -1791,7 +1836,14 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         f.id = "KV-%s-%03d" % (task.name.upper()[:6].replace("-", ""), i + 1)
         f.hold = hold_reason(f, root)
     util.stage("Scoring policy (%s): confidence + second opinion" % precision)
-    apply_scoring(found, root, model if time_left() > 0 else None, precision, log=util.step)
+    pre_repair_end = (t0 + PRE_REPAIR_SHARE * (deadline - t0)) if deadline else None
+    if deadline and model is not None:
+        util.info("time plan : %.0fs left; review+scoring until %.0fs, then repair (%.0f%% of the window reserved)"
+                  % (time_left(), max(0, pre_repair_end - time.time()), (1 - PRE_REPAIR_SHARE) * 100))
+    client.slot_end = pre_repair_end
+    apply_scoring(found, root, model if time_left() > 0 else None, precision, log=util.step,
+                  stop_at=pre_repair_end, repair_first=max_findings)
+    client.slot_end = None
     n_hold = sum(1 for f in found if f.hold)
     util.info("precision : %d SUBMIT candidates, %d HOLD (kept in evidence, not reported)" % (len(found) - n_hold, n_hold))
     util.good("%d unique finding(s) after dedupe (%s)" % (len(found), note)) if found else \
@@ -1842,17 +1894,24 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         mc = mechanical_fix(root, f)
         if mc:
             cands.append(mc)
-        if client.provider != "offline":
-            cands += model_candidates(root, f, client, raw_log_dir=os.path.join(work_dir, "llm_log"), call_no=1)
+        need = client.avg_call(60, kind="patch") * 1.1 + 20   # one patch call + gates, at measured patch speed
+        out_of_time = model is not None and time_left() < need
+        if out_of_time:
+            util.warn("%.0fs left < ~%.0fs a model patch needs here: %s" %
+                      (time_left(), need, "trying the mechanical fix only" if mc else "no mechanical fix for this pattern"))
+        elif model is not None:
+            cands += model_candidates(root, f, model, raw_log_dir=os.path.join(work_dir, "llm_log"), call_no=1)
             model_calls = 1
-            if not cands and model_calls < 2:
-                cands += model_candidates(root, f, client, prior_reason="the response could not be parsed into a candidate",
+            if not cands and model_calls < 2 and time_left() >= need:
+                cands += model_candidates(root, f, model, prior_reason="the response could not be parsed into a candidate",
                                           strict=True, raw_log_dir=os.path.join(work_dir, "llm_log"), call_no=2)
                 model_calls = 2
         f.model_calls = model_calls
         if not cands:
             why = ("no mechanical fix for this pattern and no model configured (add --provider)"
-                   if client.provider == "offline" else "model returned no usable diff")
+                   if client.provider == "offline" else
+                   "deadline: not enough time left for a model patch" if out_of_time else
+                   "model returned no usable diff")
             util.warn("no candidate: " + why)
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": why}, None))
@@ -1880,12 +1939,20 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
 
         chosen: Optional[Candidate] = None
         validation: Dict = {"status": "Rejected", "gates": []}
-        reflection_used = False
+        retried = [False]
         for c in cands:
             pol = check_policy(f, c.diff)
             if pol:
                 c.status = "policy: " + pol
                 util.step("%-28s rejected (policy: %s)" % (c.label, pol))
+                # reflection: once, tell the model why every candidate so far was refused
+                if (c.source == "model" and model is not None and not retried[0]
+                        and all((x.status or "").startswith("policy") for x in cands) and time_left() >= need):
+                    retried[0] = True
+                    more = model_candidates(root, f, client, prior_reason="policy: " + pol)
+                    for m in more[:1]:
+                        m.label = "retry: " + m.label
+                        cands.append(m)
                 continue
             gates: List[Dict] = []
             tree = os.path.join(scratch, "patched")
@@ -1945,8 +2012,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             util.step("%-28s %s" % (c.label, c.status))
             validation = {"status": "Rejected", "gates": gates}
             # reflection: tell the model why, once
-            if c.source == "model" and model is not None and not reflection_used and model_calls < 2:
-                reflection_used = True
+            if c.source == "model" and model is not None and len(cands) < 4 and not retried[0] and time_left() >= need:
+                retried[0] = True
                 model_calls += 1
                 f.model_calls = model_calls
                 more = model_candidates(root, f, client, prior_reason=c.status + ": " + gates[-1]["detail"],
@@ -1971,6 +2038,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                                                             "detail": "HOLD: " + f.hold}, None))
             continue
         if time_left() <= 0:
+            util.warn("deadline reached: %s not repaired (finding stays in the report as unpatched)" % f.id)
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": "deadline reached before repair"}, None))
             continue

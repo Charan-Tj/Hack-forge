@@ -14,7 +14,8 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 # Terminal styling (degrades to plain text when not a TTY or NO_COLOR is set)
 # ---------------------------------------------------------------------------
-_USE_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+_USE_COLOR = os.environ.get("NO_COLOR") is None and (
+    sys.stdout.isatty() or os.environ.get("FORCE_COLOR", "") not in ("", "0"))
 
 
 def _c(code: str, s: str) -> str:
@@ -60,11 +61,13 @@ def set_log_file(path: Optional[str]) -> None:
 
 
 def _emit(line: str) -> None:
+    # flush=True: when stdout is a pipe (run_final.sh | tee) Python would
+    # otherwise buffer 8 KB and the terminal stays silent for minutes.
     try:
-        print(line)
+        print(line, flush=True)
     except UnicodeEncodeError:
         encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-        print(line.encode(encoding, errors="replace").decode(encoding, errors="replace"))
+        print(line.encode(encoding, errors="replace").decode(encoding, errors="replace"), flush=True)
     if _LOG_FH:
         global _ANSI
         if _ANSI is None:
