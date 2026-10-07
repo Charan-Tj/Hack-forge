@@ -131,6 +131,9 @@ class SFinding:
     signature: str = ""
     duplicates: int = 0
     model_calls: int = 0
+    confidence: float = 0.5        # 0..1 - probability this is a real, reportable weakness
+    conf_why: str = ""             # how the confidence was built (shown to the judge)
+    hold: str = ""
 
 
 def _root_path(root: str, rel: str) -> str:
@@ -299,12 +302,15 @@ def findings_from_sarif(root: str, sarif: dict, prefix: str) -> List[SFinding]:
             snippet = "\n".join("%5d  %s" % (i + 1, lines[i]) for i in range(max(0, line - 3), min(len(lines), eline + 2)))
             short = rid.split(".")[-1]
             fix = rl.get("help", {}).get("text", "") or rl.get("fullDescription", {}).get("text", "")
+            conf_tag = next((t.split()[0] for t in tags if t.endswith("CONFIDENCE")), "MEDIUM")
+            conf = {"HIGH": 0.75, "MEDIUM": 0.55, "LOW": 0.35}.get(conf_tag, 0.5)
             out.append(SFinding(id="", rule=short, cwe=cwe_id, cwe_name=name or cwe_name_for(cwe_id),
                                 severity=_sev_for(cwe_id, level), file=fpath, line=line, end_line=eline,
                                 message=msg.strip(), snippet=snippet,
                                 func=_enclosing_func(lines, line, EXT_LANG.get(os.path.splitext(fpath)[1], "")),
                                 source="semgrep", fix_hint=fix[:600],
-                                critical=bool(CRITICAL_RE.search(fpath)) or cwe_id in CRITICAL_CWES))
+                                critical=bool(CRITICAL_RE.search(fpath)) or cwe_id in CRITICAL_CWES,
+                                confidence=conf, conf_why="semgrep rule %s confidence" % conf_tag.lower()))
     return out
 
 
@@ -347,8 +353,12 @@ BUILTIN_RULES = [
     (("python", "php", "java", "javascript", "typescript", "go", "ruby"),
      r"(?:SELECT|INSERT|UPDATE|DELETE)\b[^\n;]*(?:\"|')\s*\+\s*\w|(?:SELECT|INSERT|UPDATE|DELETE)\b[^\n;]*%\s*\(|f\"(?:SELECT|INSERT|UPDATE|DELETE)\b",
      "CWE-89", "SQL Injection", "Critical", "SQL built by string concatenation/formatting.", None),
+    (("java",), r"(?:Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder)\s*\([^;]*(?:\"(?:sh|bash|cmd(?:\.exe)?)\"\s*,\s*\"(?:-c|/c)\"|\+\s*\w)", "CWE-78",
+     "OS Command Injection", "Critical", "Shell command built from concatenated input (sh -c / cmd /c).", None),
     (("java",), r"Runtime\.getRuntime\(\)\.exec\s*\(", "CWE-78", "OS Command Injection", "High",
      "Runtime.exec with a composed command.", None),
+    (("java",), r"(?:\.sendRedirect\s*\(\s*(?![\"'])\w|(?:HttpHeaders\.LOCATION|\"Location\")\s*,\s*(?![\"'])\w)", "CWE-601",
+     "Open Redirect", "Medium", "Redirect target / Location header set from a non-literal value.", None),
     (("java",), r"new\s+ObjectInputStream\s*\(", "CWE-502", "Deserialization of Untrusted Data", "High",
      "Java native deserialization.", None),
     (("php",), r"\beval\s*\(|\bsystem\s*\(|\bshell_exec\s*\(|\bpassthru\s*\(", "CWE-78", "OS Command Injection", "Critical",
@@ -410,6 +420,11 @@ def _block_comment_mask(lines: List[str], lang: str) -> List[bool]:
     return mask
 
 
+BUILTIN_CONF = {"CWE-89": 0.65, "CWE-95": 0.6, "CWE-78": 0.6, "CWE-943": 0.65, "CWE-502": 0.6, "CWE-295": 0.7,
+                "CWE-1004": 0.7, "CWE-614": 0.7, "CWE-798": 0.5, "CWE-328": 0.45, "CWE-79": 0.45, "CWE-601": 0.5,
+                "CWE-347": 0.5, "CWE-915": 0.45, "CWE-215": 0.55, "CWE-1333": 0.35, "CWE-120": 0.5, "CWE-98": 0.6}
+
+
 def run_builtin(root: str, files: List[str]) -> List[SFinding]:
     out: List[SFinding] = []
     for rel in files:
@@ -440,7 +455,9 @@ def run_builtin(root: str, files: List[str]) -> List[SFinding]:
                                         severity=sev, file=rel, line=i + 1, end_line=i + 1, message=msg,
                                         snippet=snippet, func=_enclosing_func(lines, i + 1, lang), source="builtin",
                                         fix_hint=("mechanical: %s -> %s" % fix) if fix else "",
-                                        critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES))
+                                        critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES,
+                                        confidence=BUILTIN_CONF.get(cwe_id, 0.45),
+                                        conf_why="built-in pattern (%s)" % name.lower()))
     return out
 
 
@@ -473,6 +490,9 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
     for f in found:
         if f.cwe in ("CWE-1357",):
             f.severity = "Low"            # supply-chain hygiene, not a code defect
+        if is_test_path(f.file) and f.severity in ("Critical", "High"):
+            f.severity = "Low"            # a credential/sink inside a test is a fixture, not production exposure
+            f.message = "[in test code] " + f.message
         prev = merged[-1] if merged else None
         if prev and prev.cwe == f.cwe and prev.file == f.file and prev.func == f.func \
                 and f.line - prev.end_line <= 12:
@@ -484,20 +504,142 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
             continue
         f.signature = util.sha256_bytes(("%s|%s|%s" % (f.cwe, f.file, f.func or f.line)).encode())[:16]
         merged.append(f)
+    return sorted(merged, key=rank_key), note
+
+
+_TEST_PATH_RE = re.compile(r"(^|/)(tests?|spec|specs|__tests__|testdata|fixtures|mocks?)(/|$)|(_test|Test|\.spec|\.test)\.\w+$")
+
+
+def is_test_path(rel: str) -> bool:
+    return bool(_TEST_PATH_RE.search(rel))
+
+
+_HOLD_PATH_RE = re.compile(r"(^|/)(static|public|assets|resources/static|\.github|docs?|tests?|spec|specs|__tests__|"
+                           r"fixtures|mocks?|node_modules|vendor|examples?|samples?|benchmarks?|\.kavach)(/|$)|\.min\.js$", re.I)
+_SECURE_VARIANT_RE = re.compile(r"(impossible|secure|safe|fixed|hardened|patched|mitigat)", re.I)
+_COMMENT_RE = re.compile(r"^\s*(//|#|/\*|\*|<!--|--)")
+
+
+# Submission policy, modelled on DARPA AIxCC scoring: every correct finding/patch
+# earns points, every wrong one lowers a non-linear accuracy multiplier (90%
+# accuracy ~ no penalty, 50% -> -6%, 40% -> -13%), and last-minute submissions
+# earn half. So: submit only what clears a confidence bar, confirm borderline
+# findings with a second opinion, and keep the report current at all times.
+PRECISION_THRESHOLD = {"strict": 0.7, "balanced": 0.5, "recall": 0.3}
+REVIEW_SHARE = 0.35      # at most this share of the deadline goes to the review stage; the rest to repair
+
+_CONFIRM_PROMPT = """You are the second reviewer in a bug-bounty triage. A scanner flagged the code below.
+Decide whether this is a REAL, reachable weakness in this application (attacker-influenced data can reach
+the sink and cause the stated impact), or a FALSE_POSITIVE (constant/trusted data, dead or test code,
+already mitigated, or the pattern is benign here). If you cannot tell from this excerpt, say UNSURE.
+
+Flagged: {cwe} {title} at {file}:{line} - {why}
+Evidence line: {evidence}
+
+Answer with one word on the first line - REAL, FALSE_POSITIVE or UNSURE - then one sentence citing the
+line numbers that justify it.
+
+--- code (leading numbers are line numbers) ---
+{code}
+"""
+
+
+def confirm_finding(root: str, f: SFinding, client: Optional[llm.LLMClient]) -> Tuple[Optional[bool], str]:
+    """Second opinion on a borderline finding. Returns (True real / False FP /
+    None unsure, justification). Only adjusts confidence; never the evidence."""
+    if client is None:
+        return None, "no model"
+    text = util.read_text(_root_path(root, f.file))
+    lines = text.splitlines()
+    lo, hi = max(0, f.line - 40), min(len(lines), f.end_line + 30)
+    code = "\n".join("%4d  %s" % (i + 1, lines[i]) for i in range(lo, hi))
+    ev = lines[f.line - 1].strip() if 0 < f.line <= len(lines) else ""
+    try:
+        resp = client.complete(_CONFIRM_PROMPT.format(cwe=f.cwe, title=f.cwe_name, file=f.file, line=f.line,
+                                                      why=f.message[:200], evidence=ev[:160], code=code),
+                               system="You are a precise, sceptical application-security reviewer.", max_tokens=160)
+    except llm.LLMUnavailable as e:
+        return None, str(e)
+    head = resp.strip().split("\n", 1)
+    verdict = head[0].strip().upper()
+    just = (head[1].strip() if len(head) > 1 else head[0][5:].strip())[:200]
+    if verdict.startswith("REAL"):
+        # a REAL verdict must point at real lines near the finding, or it is
+        # just agreement (small models say REAL to almost everything)
+        cited = [int(x) for x in re.findall(r"\b(\d{1,5})\b", just)]
+        if not any(abs(c - f.line) <= 60 and 1 <= c <= len(lines) for c in cited):
+            return None, "REAL without a line citation - treated as unsure"
+        return True, just
+    if verdict.startswith("FALSE"):
+        return False, just
+    return None, just or "unsure"
+
+
+def apply_scoring(found: List[SFinding], root: str, client: Optional[llm.LLMClient], mode: str,
+                  log=lambda m: None, max_confirm: int = 8) -> None:
+    """Compute final confidence and the SUBMIT/HOLD decision for each finding."""
+    thr = PRECISION_THRESHOLD.get(mode, 0.5)
+    # cheap evidence adjustments
+    for f in found:
+        why = [f.conf_why]
+        if f.duplicates:
+            f.confidence += 0.05; why.append("+ repeated sink in same function")
+        if f.critical and f.cwe in CRITICAL_CWES and f.source != "model-review":
+            f.confidence += 0.05; why.append("+ high-impact class")
+        if is_test_path(f.file) or _HOLD_PATH_RE.search(f.file):
+            f.confidence -= 0.3; why.append("- non-application path")
+        if _SECURE_VARIANT_RE.search(os.path.basename(f.file)) or _SECURE_VARIANT_RE.search(f.func or ""):
+            f.confidence -= 0.3; why.append("- 'secure' variant")
+        f.confidence = max(0.0, min(1.0, f.confidence))
+        f.conf_why = "; ".join(w for w in why if w)
+    # second opinion on borderline, otherwise-submittable findings
+    if client is not None:
+        border = [f for f in found if not f.hold and thr - 0.2 <= f.confidence < thr + 0.15]
+        border.sort(key=lambda f: -cwemod.severity_rank(f.severity))
+        for f in border[:max_confirm]:
+            v, just = confirm_finding(root, f, client)
+            if v is True:
+                f.confidence = min(1.0, f.confidence + 0.2); f.conf_why += "; + second opinion: REAL (%s)" % just[:80]
+            elif v is False:
+                f.confidence = max(0.0, f.confidence - 0.25); f.conf_why += "; - second opinion: FALSE_POSITIVE (%s)" % just[:80]
+            else:
+                f.conf_why += "; second opinion unsure"
+            log("confirm %-40s %s -> %.2f" % (f.id, "REAL" if v else ("FP" if v is False else "unsure"), f.confidence))
+    for f in found:
+        if not f.hold and f.confidence < thr:
+            f.hold = "confidence %.2f below the %s threshold %.2f (%s)" % (f.confidence, mode, thr, f.conf_why)
+
+
+def hold_reason(f: SFinding, root: str = "") -> str:
+    """Precision mode: why a finding is HELD (kept in evidence, never reported).
+    False positives cost points, so anything that is not plainly application
+    code with a credible weakness stays out of the submission."""
+    if _HOLD_PATH_RE.search(f.file):
+        return "non-application path (static/test/CI/docs/vendor)"
+    if _SECURE_VARIANT_RE.search(os.path.basename(f.file)) or _SECURE_VARIANT_RE.search(f.func or ""):
+        return "deliberately secure variant (file/function named secure/impossible/safe/fixed)"
+    if f.snippet:
+        for ln in f.snippet.splitlines():
+            if ln.startswith("%5d  " % f.line) and _COMMENT_RE.match(ln[7:]):
+                return "flagged line is a comment"
+    if f.source == "model-review" and f.severity == "Low":
+        return "low-severity model opinion without tool evidence"
+    return ""
+
+
 def rank_key(f: SFinding):
     lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
-    parts = f.file.lower().split("/")
-    base = parts[-1]
-    low_signal = (parts[0] in {"config", "test", "tests", "spec"} or
-                  base.endswith(".config.js") or lang in ("yaml", "json"))
-    return (1 if low_signal else 0, -cwemod.severity_rank(f.severity), f.file, f.line)
+    code = 0 if lang not in ("", "yaml", "json") else 1      # code before config/CI
+    if is_test_path(f.file) or _HOLD_PATH_RE.search(f.file):
+        code = 2                                              # test fixtures / static / CI last
+    return (code, -cwemod.severity_rank(f.severity), f.file, f.line)
 
 
 def patchable(f: SFinding) -> bool:
-    """Findings that a code patch can address (secrets and config/CI hygiene
-    go to a human instead and must not consume repair slots)."""
+    """Findings that a code patch can address (secrets, config/CI hygiene and
+    test fixtures go to a human instead and must not consume repair slots)."""
     lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
-    return f.cwe != "CWE-798" and lang not in ("", "yaml", "json")
+    return f.cwe != "CWE-798" and lang not in ("", "yaml", "json") and not is_test_path(f.file)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +700,32 @@ def review_files(root: str, files: List[str], limit: int = 8) -> List[str]:
     return [rel for _, rel, _ in scored[:limit]]
 
 
+def _handler_windows(lines: List[str], before: int = 12, after: int = 48, cap: int = 320) -> str:
+    """Show the model only the regions around request handlers (real line
+    numbers kept), not whole 1,000-line files: 3-5x fewer prompt tokens, and
+    the evidence check still maps back to the file."""
+    if len(lines) <= cap:
+        return "\n".join("%4d  %s" % (i + 1, l) for i, l in enumerate(lines))
+    hits = [i for i, l in enumerate(lines) if _HANDLER_HINT.search(l)]
+    spans: List[List[int]] = []
+    for h in hits:
+        lo, hi = max(0, h - before), min(len(lines), h + after)
+        if spans and lo <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], hi)
+        else:
+            spans.append([lo, hi])
+    out, total = [], 0
+    for lo, hi in spans:
+        if total >= cap:
+            break
+        hi = min(hi, lo + (cap - total))
+        if out:
+            out.append("      ...")
+        out += ["%4d  %s" % (i + 1, lines[i]) for i in range(lo, hi)]
+        total += hi - lo
+    return "\n".join(out) if out else "\n".join("%4d  %s" % (i + 1, l) for i, l in enumerate(lines[:cap]))
+
+
 def _parse_review(resp: str) -> List[dict]:
     """Parse the model's JSON array; if the answer was truncated or sloppy,
     salvage every complete object in it (small models run out of tokens)."""
@@ -581,7 +749,7 @@ def _parse_review(resp: str) -> List[dict]:
 
 
 def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], existing: List[SFinding],
-                 limit: int = 8, log=lambda m: None) -> List[SFinding]:
+                 limit: int = 8, log=lambda m: None, stop_at: Optional[float] = None) -> List[SFinding]:
     """Ask the model to audit handler files; keep only findings whose cited
     evidence really is on the cited line (hallucination filter) and which
     static analysis has not already reported."""
@@ -590,13 +758,12 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
     out: List[SFinding] = []
     have = {(f.cwe, f.file) : f for f in existing}
     for rel in review_files(root, files, limit):
+        if stop_at and time.time() > stop_at:
+            log("review budget used (%.0f%% of the deadline) - moving on to repair" % (REVIEW_SHARE * 100))
+            break
         text = util.read_text(os.path.join(root, rel))
         lines = text.splitlines()
-        if len(lines) > 420:
-            lines_shown = lines[:420]
-        else:
-            lines_shown = lines
-        code = "\n".join("%4d  %s" % (i + 1, l) for i, l in enumerate(lines_shown))
+        code = _handler_windows(lines)
         try:
             resp = client.complete(_REVIEW_PROMPT.format(checklist=REVIEW_CHECKLIST, file=rel, code=code),
                                    system="You are a precise application-security auditor. JSON only.",
@@ -638,7 +805,8 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
                                 message=("%s (model review - unverified by a tool)" % str(it.get("why", "")).strip())[:400],
                                 snippet=snippet, func=str(it.get("function") or _enclosing_func(lines, hit, "")),
                                 source="model-review", fix_hint=str(it.get("fix", ""))[:300],
-                                critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES))
+                                critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES,
+                                confidence=0.4, conf_why="model opinion with line evidence"))
             kept += 1
         log("review %-36s %d finding(s) kept, %d discarded (evidence not on cited line / duplicate)" % (rel, kept, dropped))
     return out
@@ -878,10 +1046,18 @@ def _scratch_copy(root: str, dest: str) -> None:
     for d in DEP_DIRS:
         src = os.path.join(root, d)
         if os.path.isdir(src) and not os.path.exists(os.path.join(dest, d)):
-            os.symlink(os.path.abspath(src), os.path.join(dest, d))
+            try:
+                os.symlink(os.path.abspath(src), os.path.join(dest, d))
+            except (OSError, NotImplementedError):
+                # Windows without symlink privilege: try a junction, else copy
+                r = util.run(["cmd", "/c", "mklink", "/J", os.path.join(dest, d), os.path.abspath(src)], timeout=60) \
+                    if os.name == "nt" else None
+                if r is None or not r.ok:
+                    shutil.copytree(src, os.path.join(dest, d), symlinks=True, dirs_exist_ok=True)
 
 
 INSTALLERS = {
+    "java": ["./gradlew", "compileJava", "-q", "--no-daemon"],      # warms the dependency cache
     "node": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--silent"],
     "python": [sys.executable, "-m", "pip", "install", "-q", "--break-system-packages", "-r", "requirements.txt"],
 }
@@ -894,6 +1070,11 @@ def install_deps(root: str, stacks: List[str], log=lambda m: None, timeout: int 
             continue
         if s == "python" and not os.path.exists(os.path.join(root, "requirements.txt")):
             continue
+        if s == "java":
+            if os.path.exists(os.path.join(root, "pom.xml")) and shutil.which("mvn"):
+                cmd = ["mvn", "-q", "compile"]
+            elif not os.path.exists(os.path.join(root, "gradlew")):
+                continue
         if s == "node" and os.path.isdir(os.path.join(root, "node_modules")):
             return "node dependencies already installed"
         if s == "node":
@@ -1009,27 +1190,79 @@ def _apply_unified_python(tree: str, diff: str) -> None:
         util.write_text(target, result)
 
 
+def apply_unified_diff(tree: str, diff: str, fuzz: int = 3) -> Tuple[bool, str]:
+    """Minimal unified-diff applier for machines without patch/git: one or
+    more files, hunks applied by matching context with a small offset
+    tolerance. Fails closed on any mismatch."""
+    files = re.split(r"(?m)^--- ", diff)
+    applied = []
+    for chunk in files[1:]:
+        head, _, body = chunk.partition("\n")
+        m = re.match(r"^\+\+\+ (\S+)", body)
+        if not m:
+            return False, "malformed diff header"
+        rel = re.sub(r"^b/", "", m.group(1))
+        path = os.path.join(tree, rel)
+        if not os.path.exists(path):
+            return False, "no such file: " + rel
+        src = util.read_text(path).splitlines(keepends=True)
+        hunks = re.split(r"(?m)^@@ ", body.split("\n", 1)[1])[1:]
+        offset = 0
+        for h in hunks:
+            hm = re.match(r"-(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", h)
+            if not hm:
+                return False, "malformed hunk"
+            start = int(hm.group(1)) - 1 + offset
+            lines = h.split("\n")[1:]
+            old = [l[1:] + "\n" for l in lines if l.startswith((" ", "-"))]
+            new = [l[1:] + "\n" for l in lines if l.startswith((" ", "+"))]
+            if lines and lines[-1] == "":
+                pass
+            pos = None
+            for delta in [0] + [d for k in range(1, fuzz + 1) for d in (-k, k)]:
+                i = start + delta
+                if i < 0 or i + len(old) > len(src):
+                    continue
+                if [x.rstrip("\n") for x in src[i:i + len(old)]] == [x.rstrip("\n") for x in old]:
+                    pos = i; break
+            if pos is None:
+                return False, "hunk does not apply at %s:%d" % (rel, start + 1)
+            src[pos:pos + len(old)] = new
+            offset += len(new) - len(old)
+        util.write_text(path, "".join(src))
+        applied.append(rel)
+    return bool(applied), "patching file " + ", ".join(applied)
+
+
 def g0_apply(tree: str, diff: str) -> Tuple[bool, str]:
     tree = os.path.abspath(tree)
     try:
         _parse_hunks(diff)  # validate paths before an external tool can write
     except ValueError as e:
         return False, "python applier rejected diff: %s" % e
-    patch = shutil.which("patch")
-    if patch:
-        pf = os.path.join(tree, ".kv_patch.diff")
-        util.write_text(pf, diff)
-        r = util.run([patch, "-p1", "-f", "-i", pf], cwd=tree, timeout=60)
-        try:
-            os.remove(pf)
-        except OSError:
-            pass
+    pf = os.path.join(tree, ".kv_patch.diff")
+    util.write_text(pf, diff)
+    r = None
+    if shutil.which("patch"):
+        r = util.run(["patch", "-p1", "-f", "-i", pf], cwd=tree, timeout=60)
+    elif shutil.which("git"):   # git apply works outside a repository too
+        r = util.run(["git", "apply", "--ignore-whitespace", "-p1", pf], cwd=tree, timeout=60)
+        if r.ok:
+            r.out = "applied with git apply"
+    try:
+        os.remove(pf)
+    except OSError:
+        pass
+    if r is not None:
         detail = (r.out.strip().splitlines() or r.err.strip().splitlines() or ["applied"])[-1][-200:]
-        return r.ok, "external patch: " + detail
+        return r.ok, ("patch: " if r.ok else "patch failed: ") + detail
     try:
         _apply_unified_python(tree, diff)
         return True, "python applier: applied"
     except (OSError, ValueError) as e:
+        ok, msg = apply_unified_diff(tree, diff)
+        if ok:
+            return True, "python applier: " + msg
         return False, "python applier: %s" % e
 
 
@@ -1044,9 +1277,95 @@ SYNTAX_CHECK = {
 }
 
 
-def g1_syntax(tree: str, rel: str) -> Tuple[bool, str]:
+_JAVAC_PARSE_ERR = re.compile(r"error: (?:';' expected|illegal start of|reached end of file|not a statement|"
+                              r"unclosed|class, interface, enum, or record expected|<identifier> expected|"
+                              r"'\)' expected|'\{' expected|'\}' expected|orphaned|else without if|"
+                              r"missing return statement|unbalanced|invalid method declaration)")
+
+
+def _balanced(text: str) -> Optional[str]:
+    """Cheap parse sanity for languages without a local checker: brackets
+    must balance outside strings/comments."""
+    depth = {"(": 0, "[": 0, "{": 0}
+    pairs = {")": "(", "]": "[", "}": "{"}
+    i, n, in_str, in_line, in_block = 0, len(text), "", False, False
+    while i < n:
+        c = text[i]
+        if in_line:
+            in_line = c != "\n"
+        elif in_block:
+            if text.startswith("*/", i):
+                in_block = False; i += 1
+        elif in_str:
+            if c == "\\":
+                i += 1
+            elif c == in_str:
+                in_str = ""
+        elif text.startswith("//", i) or text.startswith("#", i) and "python" in text[:0]:
+            in_line = True
+        elif text.startswith("/*", i):
+            in_block = True; i += 1
+        elif c in "\"'`":
+            in_str = c
+        elif c in depth:
+            depth[c] += 1
+        elif c in pairs:
+            depth[pairs[c]] -= 1
+            if depth[pairs[c]] < 0:
+                return "unbalanced '%s'" % c
+        i += 1
+    bad = [k for k, v in depth.items() if v != 0]
+    return ("unbalanced '%s'" % bad[0]) if bad else None
+
+
+_PROJECT_COMPILE: Dict[str, Optional[List[str]]] = {}
+
+
+def project_compile_cmd(root: str) -> Optional[List[str]]:
+    """A real compile command for JVM projects, if the project's own build
+    tool can compile the UNPATCHED tree here (deps cached, right JDK).
+    Probed once per run; None means fall back to parse-level checks."""
+    if root in _PROJECT_COMPILE:
+        return _PROJECT_COMPILE[root]
+    cmd = None
+    cands = []
+    if os.path.exists(os.path.join(root, "gradlew")):
+        cands.append(["./gradlew", "compileJava", "--offline", "-q", "--no-daemon"])
+    if os.path.exists(os.path.join(root, "pom.xml")) and shutil.which("mvn"):
+        cands.append(["mvn", "-q", "-o", "compile"])
+    for c in cands:
+        r = util.run(c, cwd=root, timeout=420)
+        if r.ok:
+            cmd = c; break
+    _PROJECT_COMPILE[root] = cmd
+    return cmd
+
+
+def g1_syntax(tree: str, rel: str, root: Optional[str] = None) -> Tuple[bool, str]:
     lang = EXT_LANG.get(os.path.splitext(rel)[1], "")
     mk = SYNTAX_CHECK.get(lang)
+    if lang in ("java", "kotlin", "csharp", "scala", "swift", "typescript") and not mk:
+        if lang in ("java", "kotlin") and root:
+            pc = project_compile_cmd(root)
+            if pc:
+                r = util.run(pc, cwd=tree, timeout=600)
+                if r.ok:
+                    return True, "%s: project compiles" % pc[0]
+                err = [l for l in (r.err + r.out).splitlines() if "error:" in l or "error" in l.lower()][:1]
+                return False, "%s: %s" % (pc[0], (err[0] if err else "compile failed")[-200:])
+        if lang == "java" and shutil.which("javac"):
+            # parse-level errors only: unresolved imports are expected without the classpath
+            tmp = tempfile.mkdtemp(prefix="kv_javac_")
+            r = util.run(["javac", "-proc:none", "-d", tmp, os.path.join(tree, rel)], timeout=90)
+            shutil.rmtree(tmp, ignore_errors=True)
+            if r.ok:
+                return True, "javac: ok"
+            m = _JAVAC_PARSE_ERR.search(r.err)
+            if m:
+                return False, "javac: " + m.group(0)[7:]
+            return True, "javac: parses (symbol resolution skipped without the project classpath)"
+        why = _balanced(util.read_text(os.path.join(tree, rel)))
+        return (False, why) if why else (True, "brackets balance (no %s parser here)" % lang)
     if not mk:
         return True, "no syntax checker for %s here (not checked)" % (lang or "this file type")
     cmd = mk(_root_path(tree, rel))
@@ -1107,7 +1426,8 @@ TEST_RUNNERS = {
     "node": ("npm", ["npm", "test", "--silent"], "node_modules"),
     "python": ("pytest", [sys.executable, "-m", "pytest", "-q", "-x", "--timeout=60"], None),
     "go": ("go", ["go", "test", "./..."], None),
-    "java": ("mvn", ["mvn", "-q", "-o", "test"], None),
+    "java": ("mvn", ["mvn", "-q", "-o", "test"], "pom.xml"),
+    "gradle": ("gradle", ["./gradlew", "test", "--offline", "-q"], "gradlew"),
     "rust": ("cargo", ["cargo", "test", "--offline", "-q"], None),
     "php": ("phpunit", ["vendor/bin/phpunit"], "vendor"),
     "ruby": ("bundle", ["bundle", "exec", "rake", "test"], None),
@@ -1116,10 +1436,20 @@ TEST_RUNNERS = {
 
 def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optional[bool], str]:
     """None = could not run here (honest skip); else pass/fail + summary line."""
-    for s in stacks:
+    order = list(stacks)
+    if "java" in order and os.path.exists(os.path.join(tree, "gradlew")):
+        order.insert(order.index("java"), "gradle")
+    for s in order:
         if s not in TEST_RUNNERS:
             continue
         tool, cmd, needs = TEST_RUNNERS[s]
+        if needs and not os.path.exists(os.path.join(tree, needs)):
+            if s in ("java", "gradle"):
+                continue                      # try the other build tool
+            return None, "%s dependencies not installed (%s/ missing) - suite cannot run offline" % (s, needs)
+        if cmd[0].startswith("./"):
+            if not os.access(os.path.join(tree, cmd[0]), os.X_OK) and os.name != "nt":
+                return None, "%s not executable" % cmd[0]
         resolved = shutil.which(cmd[0])
         if s == "node" and not resolved:
             return None, "not runnable here: npm not on PATH"
@@ -1127,8 +1457,6 @@ def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optiona
             cmd = [resolved] + cmd[1:]
         elif shutil.which(cmd[0]) is None:
             return None, "%s not installed" % tool
-        if needs and not os.path.isdir(os.path.join(tree, needs)):
-            return None, "%s dependencies not installed (%s/ missing) - suite cannot run offline" % (s, needs)
         if s == "node":
             try:
                 pj = json.load(open(os.path.join(tree, "package.json")))
@@ -1145,7 +1473,9 @@ def run_tests(tree: str, stacks: List[str], timeout: int = 240) -> Tuple[Optiona
         if r.code == 5 or "no tests ran" in blob:
             return None, "no tests collected"
         if re.search(r"No module named (pytest|unittest)|command not found|ENOENT|Cannot find module|"
-                     r"ECONNREFUSED|MongoNetworkError|connect ECONNREFUSED|could not connect", blob):
+                     r"ECONNREFUSED|MongoNetworkError|connect ECONNREFUSED|could not connect|"
+                     r"MissingProjectException|Could not resolve|offline mode|Unable to resolve|"
+                     r"Plugin .* not found|No such file or directory", blob):
             return None, "suite cannot run here: " + tail
         return r.ok, tail
     return None, "no recognised test runner for %s" % ", ".join(stacks)
@@ -1408,6 +1738,10 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
         "pov_hexdump": f.snippet, "asan_report": "%s\n\n%s" % (f.message, f.fix_hint),
         "critical": f.critical, "duplicates": f.duplicates,
         "model_calls": f.model_calls,
+        "hold_reason": getattr(f, "hold", ""),
+        "confidence": round(f.confidence, 2), "confidence_why": f.conf_why,
+        "submit": (not getattr(f, "hold", "")) and not (f.source == "model-review" and
+                                                        validation.get("status") != "Verified"),
         "patch": ({"diff": chosen.diff, "source": chosen.source, "rationale": chosen.rationale,
                    "rejected": [c.status for c in cands if not c.chosen and c.status and c.status != "Verified"][:3]}
                   if chosen else {}),
@@ -1423,8 +1757,12 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
 def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str = "critical",
         interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
         publish=lambda: None, progress=None, deps: bool = False, review: bool = True,
-        review_files_n: int = 8) -> Dict:
+        review_files_n: int = 8, deadline: Optional[float] = None, precision: str = "balanced") -> Dict:
     root = task.root
+    client.deadline = deadline
+
+    def time_left() -> float:
+        return (deadline - time.time()) if deadline else 1e9
     stacks = task.raw.get("stacks") or detect_stacks(root)
     t0 = time.time()
     util.stage("Stack & surface")
@@ -1440,7 +1778,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
     model = client if client.provider != "offline" else None
     if review and model is not None:
         util.stage("Model review (logic bugs: authorization, mass assignment, exposure, enumeration)")
-        rv = model_review(root, files, model, found, limit=review_files_n, log=util.step)
+        rv = model_review(root, files, model, found, limit=review_files_n, log=util.step,
+                          stop_at=(t0 + REVIEW_SHARE * (deadline - t0)) if deadline else None)
         if rv:
             found = sorted(found + rv, key=rank_key)
             note += "; model review %d finding(s) (%s)" % (len(rv), client.model)
@@ -1450,6 +1789,11 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         util.info(util.dim("model review skipped (no model; add --provider ollama for logic-bug review)"))
     for i, f in enumerate(found):
         f.id = "KV-%s-%03d" % (task.name.upper()[:6].replace("-", ""), i + 1)
+        f.hold = hold_reason(f, root)
+    util.stage("Scoring policy (%s): confidence + second opinion" % precision)
+    apply_scoring(found, root, model if time_left() > 0 else None, precision, log=util.step)
+    n_hold = sum(1 for f in found if f.hold)
+    util.info("precision : %d SUBMIT candidates, %d HOLD (kept in evidence, not reported)" % (len(found) - n_hold, n_hold))
     util.good("%d unique finding(s) after dedupe (%s)" % (len(found), note)) if found else \
         util.warn("no finding (%s)" % note)
     by_sev: Dict[str, int] = {}
@@ -1457,7 +1801,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
     if found:
         util.info("severity  : " + ", ".join("%s %d" % kv for kv in sorted(by_sev.items(), key=lambda kv: -cwemod.severity_rank(kv[0]))))
-    todo = [f for f in found if patchable(f)][:max_findings] + [f for f in found if not patchable(f)]
+    todo = [f for f in found if patchable(f) and not f.hold][:max_findings] + \
+           [f for f in found if not patchable(f) and not f.hold] + [f for f in found if f.hold]
     n_patchable = sum(1 for f in found if patchable(f))
     if n_patchable > max_findings:
         util.info(util.dim("repairing the top %d patchable findings by severity; the rest are listed in the evidence"
@@ -1466,17 +1811,17 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
     findings_out: List[Dict] = []
     if progress is not None:
         progress.findings = findings_out
-    verified = 0
-    skipped = 0
+    verified = [0]
+    skipped = [0]
     scratch = os.path.abspath(os.path.join(work_dir, "scratch"))
-    base_tests: Tuple[Optional[bool], str] = (None, "")
-    tests_checked = False
+    tests_state: Dict = {"checked": False, "base": (None, "")}
     http_state = http_baseline(task)
     if http_state.get("error"):
         util.warn("HTTP G5 baseline unavailable: %s" % http_state["error"])
 
-    for f in todo:
+    def _repair_one(f: SFinding) -> None:
         util.stage("Repair & verify — %s" % f.id)
+
         util.info("%s %s (%s) at %s:%d in %s%s" % (f.cwe, f.cwe_name, f.severity, f.file, f.line, f.func,
                                                    "  [CRITICAL AREA]" if f.critical else ""))
         lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
@@ -1491,7 +1836,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             findings_out.append(_finding_dict(f, [], None, {"status": "Needs human action", "gates": [],
                                                             "detail": why}, None))
             publish()
-            continue
+            return
         cands: List[Candidate] = []
         model_calls = 0
         mc = mechanical_fix(root, f)
@@ -1512,18 +1857,24 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": why}, None))
             publish()
-            continue
+            return
         util.step("%d candidate(s): %s" % (len(cands), "; ".join(c.label for c in cands)))
 
         # ---- human approval ------------------------------------------------
+        approval_note = ("not a critical area: policy allows automatic patching (--approve critical)"
+                         if approve == "critical" else
+                         "automatic (--approve auto)" if approve == "auto" else "")
         if needs_approval(approve, f):
             decision, idx = ask_approval(f, cands, interactive)
+            approval_note = ("reviewer chose candidate #%d in the terminal" % ((idx or 0) + 1)
+                             if interactive and sys.stdin.isatty() else
+                             "unattended run (--yes): first candidate auto-approved; the pause is recorded")
             if decision == "skip":
-                skipped += 1
+                skipped[0] += 1
                 findings_out.append(_finding_dict(f, cands, None, {"status": "Skipped by reviewer", "gates": [],
                                                                    "detail": "human chose not to patch"}, None))
                 publish()
-                continue
+                return
             if idx:
                 cands.insert(0, cands.pop(idx))
 
@@ -1541,15 +1892,16 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             _scratch_copy(root, tree)
             ok, d = g0_apply(tree, c.diff); gates.append({"name": "G0 patch applies", "passed": ok, "detail": d})
             if ok:
-                ok, d = g1_syntax(tree, f.file); gates.append({"name": "G1 syntax", "passed": ok, "detail": d})
+                ok, d = g1_syntax(tree, f.file, root); gates.append({"name": "G1 syntax", "passed": ok, "detail": d})
             if ok:
                 if f.source == "model-review":
                     ok, d = g2_rereview(tree, f, model); gates.append({"name": "G2 re-review", "passed": ok, "detail": d})
                 else:
                     ok, d = g2_rescan(tree, f, stacks, scanner_used); gates.append({"name": "G2 re-scan", "passed": ok, "detail": d})
             if ok:
-                if not tests_checked:
-                    base_tests = run_tests(root, stacks); tests_checked = True
+                if not tests_state["checked"]:
+                    tests_state["base"] = run_tests(root, stacks); tests_state["checked"] = True
+                base_tests = tests_state["base"]
                 if base_tests[0] is None:
                     gates.append({"name": "G3 tests", "passed": True, "detail": "not runnable here: " + base_tests[1]})
                 else:
@@ -1572,16 +1924,20 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                               "detail": d + ("" if res is not None else " (not claimed)")})
                 ok = res is not False
             if ok:
-                g5_ok, g5_detail = http_g5(task, tree, http_state)
-                gates.append({"name": "G5 behaviour preserved", "passed": g5_ok, "detail": g5_detail})
-                ok = g5_ok
+                if task.raw.get("http_probe"):
+                    g5_ok, g5_detail = http_g5(task, tree, http_state)
+                    gates.append({"name": "G5 behaviour preserved", "passed": g5_ok, "detail": g5_detail})
+                    ok = g5_ok
+                if ok:
+                    gates.append({"name": "G5 human approval", "passed": True, "detail": approval_note})
             c.gates = gates
             if ok:
                 c.status = "Verified"; c.chosen = True; chosen = c
+                g4_proven = bool(proof_path and any(g.get("name") == "G4 proof test" and "fails on unpatched" in g.get("detail", "") for g in gates))
                 validation = {"status": "Verified", "gates": gates,
-                              "proof": ("proven" if gates[-1]["name"] == "G4 proof test" and "fails on unpatched" in gates[-1]["detail"] else "static"),
+                              "proof": ("proven" if g4_proven else "static"),
                               "regression_test": ({"file": os.path.basename(proof_path), "rel_test_path": os.path.basename(proof_path),
-                                                   "guards_bug": True} if proof_path and "fails on unpatched" in gates[-1]["detail"] else None)}
+                                                   "guards_bug": True} if g4_proven else None)}
                 for g in gates:
                     (util.good if g["passed"] else util.bad)("%s — %s" % (g["name"], g["detail"]))
                 break
@@ -1600,7 +1956,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                     cands.append(m)
         pr_bundle = None
         if chosen:
-            verified += 1
+            verified[0] += 1
+            f.confidence = min(1.0, f.confidence + 0.25); f.conf_why += "; + verified patch (G0-G5)"
             pr_bundle = _pr_bundle(task, f, chosen, validation, work_dir)
             util.good("PATCH VERIFIED — %s (%s)" % (chosen.label, validation.get("proof", "static")))
         else:
@@ -1608,13 +1965,34 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         findings_out.append(_finding_dict(f, cands, chosen, validation, pr_bundle))
         publish()
 
+    for f in todo:
+        if f.hold:
+            findings_out.append(_finding_dict(f, [], None, {"status": "Held", "gates": [],
+                                                            "detail": "HOLD: " + f.hold}, None))
+            continue
+        if time_left() <= 0:
+            findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
+                                                            "detail": "deadline reached before repair"}, None))
+            continue
+        try:
+            _repair_one(f)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:          # one bad finding must never kill the run
+            util.bad("finding %s failed: %s: %s" % (f.id, type(e).__name__, e))
+            findings_out.append(_finding_dict(f, [], None, {"status": "Error", "gates": [],
+                                                            "detail": "internal error: %s" % e}, None))
+            publish()
     done_ids = {d["id"] for d in findings_out}
     for f in found:
         if f.id not in done_ids:
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": "beyond --max-findings; not attempted"}, None))
     shutil.rmtree(scratch, ignore_errors=True)
-    metrics = {"unique_findings": len(found), "verified_patches": verified, "skipped_by_reviewer": skipped,
+    n_submit = sum(1 for d in findings_out if d.get("submit"))
+    util.info("precision : %d finding(s) SUBMIT, %d HOLD" % (n_submit, len(findings_out) - n_submit))
+    metrics = {"unique_findings": len(found), "verified_patches": verified[0], "skipped_by_reviewer": skipped[0],
+               "submit": n_submit, "hold": len(findings_out) - n_submit,
                "time_to_first_pov": ("%.1fs" % (time.time() - t0)) if found else "n/a",
                "raw_crashes": sum(1 + f.duplicates for f in found), "files_scanned": len(files),
                "stacks": stacks, "scanner": note}

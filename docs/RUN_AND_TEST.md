@@ -311,7 +311,32 @@ a model, cJSON ✔ (its own `fuzzing/` harness), tinyxml2 (C++) ✔ with a model
 offline (honest refusal: no byte-buffer entry point). Clones live in
 `targets/_onboarded/` (git-ignored); a generated harness lives in `<repo>/.kavach/`.
 
-### 7b. By hand
+### 7b. Any stack (universal track)
+
+`kavach onboard` picks the track automatically: C/C++ library → fuzz track; anything else
+(or a C repo whose harness cannot be built) → universal track. Force it with `--mode universal`.
+
+```bash
+./kavach onboard https://github.com/OWASP/NodeGoat --run --yes            # unattended
+./kavach onboard ./myapp --run --approve all                               # approve each patch
+./kavach run myapp --provider ollama --deps                                # install deps so G3 (tests) can run
+```
+
+Flags: `--approve critical|all|auto` (default critical), `--yes` (never prompt),
+`--scanner auto|semgrep|builtin`, `--max-findings N` (default 12), `--deps`,
+`--deadline-min M` (hard time box; report always written), `--no-review`.
+Input can be a git URL, a directory, or a `.tar.gz`/`.zip` of the source.
+Every run also writes `artifacts/<name>/report.md` + `report.csv` (S.No · title · severity ·
+location · steps taken) containing only SUBMIT findings — see docs/JUDGE_DEMO.md §7.
+Read the gates exactly as in the fuzz track; "not runnable here" / "not claimed" are honest
+skips, never passes in disguise.
+
+### 7c. Offline
+
+`./kavach prefetch` once with network (rule packs + local model), then everything runs
+air-gapped. Details and model sizes: docs/OFFLINE_MODELS.md.
+
+### 7d. By hand
 
 Any libFuzzer / OSS-Fuzz-style harness (`LLVMFuzzerTestOneInput`) works. Add
 `tasks/<name>.json`:

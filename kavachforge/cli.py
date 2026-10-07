@@ -42,7 +42,9 @@ def _common_kwargs(args, provider=None):
                 scanner=getattr(args, "scanner", "auto"),
                 max_findings=getattr(args, "max_findings", 12),
                 deps=getattr(args, "deps", False),
-                review=not getattr(args, "no_review", False))
+                review=not getattr(args, "no_review", False),
+                deadline_min=getattr(args, "deadline_min", 0),
+                precision=getattr(args, "precision", "balanced"))
 
 
 def _run_many(names, args, provider=None, on_each=None) -> int:
@@ -412,7 +414,7 @@ def _cmd_prefetch(args) -> int:
     else:
         util.warn("semgrep not installed (pip install semgrep); built-in rules will be used"); rc = 1
     if shutil.which("ollama"):
-        model = args.model or "qwen2.5-coder:7b"
+        model = args.model or "gpt-oss:20b"
         have = llm.ollama_models()
         if any(h == model or h.split(":")[0] == model.split(":")[0] for h in have):
             util.good("ollama model present: %s" % model)
@@ -461,6 +463,12 @@ def main(argv=None) -> int:
         sp.add_argument("--scanner", choices=["auto", "semgrep", "builtin"], default="auto",
                         help="universal track analyzer")
         sp.add_argument("--max-findings", type=int, default=12, help="universal track: repair at most N")
+        sp.add_argument("--deadline-min", type=float, default=0,
+                        help="hard time box in minutes: stop starting findings/model calls after it; "
+                             "evidence + report are always written")
+        sp.add_argument("--precision", choices=["strict", "balanced", "recall"], default="balanced",
+                        help="submission policy (AIxCC-style accuracy penalty): strict submits only "
+                             "confidence>=0.7, balanced >=0.5, recall >=0.3")
         sp.add_argument("--no-review", action="store_true",
                         help="universal track: skip the model's semantic review of handlers")
         sp.add_argument("--deps", action="store_true",
@@ -525,7 +533,7 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("onboard", help="bring your own repo: clone/scan/build-fix an "
                         "arbitrary C/C++ project into a task (one command)")
-    sp.add_argument("repo", help="git URL or local directory")
+    sp.add_argument("repo", help="git URL, local directory, or a .tar.gz/.zip of the source")
     sp.add_argument("--name", default=None, help="task/target name (default: repo name)")
     sp.add_argument("--harness", default=None, help="substring selecting one shipped harness")
     sp.add_argument("--ref", default=None, help="branch or tag to clone (URL repos)")
@@ -547,11 +555,16 @@ def main(argv=None) -> int:
     sp.add_argument("--uplift", action="store_true")
     sp.add_argument("--diff", default=None)
     sp.add_argument("--sarif", default=None)
+    sp.add_argument("--deps", action="store_true", help="install the repo's dependencies first so tests can run")
+    sp.add_argument("--no-review", action="store_true", help="skip the model's semantic review")
+    sp.add_argument("--deadline-min", type=float, default=0,
+                    help="hard time box in minutes (report always written)")
+    sp.add_argument("--precision", choices=["strict", "balanced", "recall"], default="balanced")
     sp.set_defaults(func=_cmd_onboard)
 
     sp = sub.add_parser("prefetch", help="cache semgrep rule packs + pull the local model so "
                         "everything runs offline later")
-    sp.add_argument("--model", default=None, help="ollama model to pull (default qwen2.5-coder:7b)")
+    sp.add_argument("--model", default=None, help="ollama model to pull (default gpt-oss:20b; 24 GB+: devstral-small-2:24b)")
     sp.set_defaults(func=_cmd_prefetch)
 
     sp = sub.add_parser("ci", help="pull-request check: run on changed targets, "

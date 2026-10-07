@@ -60,7 +60,11 @@ def set_log_file(path: Optional[str]) -> None:
 
 
 def _emit(line: str) -> None:
-    print(line)
+    try:
+        print(line)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(line.encode(encoding, errors="replace").decode(encoding, errors="replace"))
     if _LOG_FH:
         global _ANSI
         if _ANSI is None:

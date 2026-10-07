@@ -608,3 +608,83 @@ class TestUniversal(unittest.TestCase):
         g = u.SFinding("KV-2", "r", "CWE-601", "Redir", "Medium", "app/x.js", 1, 1, "", "", critical=False)
         self.assertTrue(u.needs_approval("critical", f)); self.assertFalse(u.needs_approval("critical", g))
         self.assertTrue(u.needs_approval("all", g)); self.assertFalse(u.needs_approval("auto", f))
+
+
+class TestFinalRound(unittest.TestCase):
+    """Final-round mechanics: precision (SUBMIT/HOLD), organizer-format report,
+    one failing finding never kills the run, archive input, Java rules."""
+
+    def _repo(self):
+        root = tempfile.mkdtemp(prefix="kv_fr_")
+        os.makedirs(os.path.join(root, "app")); os.makedirs(os.path.join(root, "static", "js"))
+        os.makedirs(os.path.join(root, "src"))
+        util.write_text(os.path.join(root, "package.json"), '{"name":"x"}')
+        util.write_text(os.path.join(root, "app", "auth.js"),
+                        "function login(req, res) {\n  const n = eval(req.body.n);\n"
+                        "  res.cookie('sid', n, { httpOnly: false });\n}\n")
+        util.write_text(os.path.join(root, "static", "js", "vendor.js"), "x = eval(y);\n")
+        util.write_text(os.path.join(root, "app", "impossible.js"), "function safe(req){ return eval(req.q); }\n")
+        util.write_text(os.path.join(root, "src", "Run.java"),
+                        "class Run { void go(String a){ new ProcessBuilder(\"sh\", \"-c\", \"ls \" + a).start();\n"
+                        " response.sendRedirect(target); } }\n")
+        return root
+
+    def test_hold_rules_and_java_rules(self):
+        from kavachforge import universal as u
+        root = self._repo()
+        found, _ = u.discover(root, ["node", "java"], scanner="builtin")
+        for f in found:
+            f.hold = u.hold_reason(f, root)
+        by = {(f.file, f.cwe): f for f in found}
+        self.assertIn("non-application", by[("static/js/vendor.js", "CWE-95")].hold)
+        self.assertIn("secure variant", by[("app/impossible.js", "CWE-95")].hold)
+        self.assertEqual(by[("app/auth.js", "CWE-95")].hold, "")
+        self.assertIn(("src/Run.java", "CWE-78"), by); self.assertIn(("src/Run.java", "CWE-601"), by)
+        self.assertEqual(by[("src/Run.java", "CWE-78")].severity, "Critical")
+
+    def test_report_format_and_error_isolation(self):
+        from kavachforge import universal as u, llm, report, config
+        root = self._repo()
+        task = config.Task(name="fr", language="node", root=root, sources=[], harness="", include_dirs=[],
+                           test_sources=[], patch_scope=[], magic=None, diff_changed=[], static_alerts=[],
+                           description="", seeds=[], raw={"stacks": ["node"]}, kind="universal")
+        client = llm.LLMClient(provider="offline", budget=1, cache_dir=tempfile.mkdtemp(), log_dir=tempfile.mkdtemp())
+        work = tempfile.mkdtemp(prefix="kv_frw_")
+        orig = u.mechanical_fix
+        calls = {"n": 0}
+
+        def boom(root_, f):            # the FIRST repair blows up; the rest must still complete
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("simulated crash")
+            return orig(root_, f)
+        u.mechanical_fix = boom
+        try:
+            res = u.run(task, client, work, approve="auto", interactive=False, scanner="builtin", review=False)
+        finally:
+            u.mechanical_fix = orig
+        st = [f["validation"]["status"] for f in res["findings"]]
+        self.assertIn("Error", st)
+        self.assertGreaterEqual(len(res["findings"]), 3)
+        self.assertEqual(sum(1 for f in res["findings"] if f["validation"]["status"] == "Held"), 2)
+        ev = {"task": {"name": "fr"}, "generated_at": "now", "metrics": res["metrics"], "findings": res["findings"]}
+        out = report.write_submission(ev, work)
+        md = util.read_text(out["md"])
+        self.assertIn("| S.No | Vulnerability title | Severity | Vulnerable file / function / location | Steps taken |", md)
+        self.assertNotIn("vendor.js", md)                 # HOLD rows never reach the report
+        self.assertIn("app/auth.js", md)
+        rows = report.submission_rows(ev)
+        self.assertEqual([r["sno"] for r in rows], list(range(1, len(rows) + 1)))
+        sev = [r["severity"] for r in rows]
+        self.assertEqual(sev, sorted(sev, key=report.SEV_ORDER.index))
+
+    def test_archive_input(self):
+        import tarfile
+        from kavachforge import onboard
+        root = self._repo()
+        tgz = os.path.join(tempfile.mkdtemp(), "handover.tar.gz")
+        with tarfile.open(tgz, "w:gz") as t:
+            t.add(root, arcname="app-src")
+        name, dest = onboard.fetch(tgz, name="handover", dest_dir=tempfile.mkdtemp())
+        self.assertEqual(name, "handover")
+        self.assertTrue(os.path.exists(os.path.join(dest, "package.json")))   # unwrapped top-level dir
