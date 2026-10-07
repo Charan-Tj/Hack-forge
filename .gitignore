@@ -9,3 +9,7 @@ targets/_onboarded/
 rules/semgrep/p_secrets.yml
 vendor/
 kavachforge-final.zip
+*.tar.gz
+*.tgz
+tasks/*_final.json
+tasks/final.json

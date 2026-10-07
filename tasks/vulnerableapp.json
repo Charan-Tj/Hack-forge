@@ -1,0 +1,19 @@
+{
+  "name": "vulnerableapp",
+  "kind": "universal",
+  "language": "java",
+  "description": "VulnerableApp (onboarded; stacks: java; static track)",
+  "root": "C:\\Users\\CHARAN\\Desktop\\Kavach\\VulnerableApp",
+  "stacks": [
+    "java"
+  ],
+  "sources": [],
+  "patch_scope": [],
+  "test_sources": [],
+  "static_alerts": [],
+  "budgets": {
+    "time_budget_s": 0
+  },
+  "_onboarded": true,
+  "diff": "git"
+}

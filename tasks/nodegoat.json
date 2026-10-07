@@ -1,0 +1,34 @@
+{
+  "name": "nodegoat",
+  "kind": "universal",
+  "language": "node",
+  "description": "NodeGoat (onboarded; stacks: node; static track)",
+  "root": "C:\\Users\\CHARAN\\Desktop\\Kavach\\NodeGoat",
+  "stacks": ["node"],
+  "sources": [],
+  "patch_scope": [],
+  "test_sources": [],
+  "static_alerts": [],
+  "allowed_targets": ["localhost:4000"],
+  "http_probe": {
+    "base_url": "http://localhost:4000",
+    "login": {
+      "path": "/login",
+      "user": "user1",
+      "password": "User1_123",
+      "user_field": "userName"
+    },
+    "routes": [
+      "/dashboard",
+      "/contributions",
+      "/allocations/2",
+      "/profile",
+      "/benefits"
+    ]
+  },
+  "budgets": {
+    "time_budget_s": 0
+  },
+  "_onboarded": true,
+  "diff": "git"
+}
