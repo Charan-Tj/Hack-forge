@@ -1543,14 +1543,17 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         if mc:
             cands.append(mc)
         need = client.avg_call(60) * 1.2 + 30          # one patch call + gates, at measured speed
-        if model is not None and time_left() < need:
+        out_of_time = model is not None and time_left() < need
+        if out_of_time:
             util.warn("%.0fs left < ~%.0fs a model patch needs here: %s" %
                       (time_left(), need, "trying the mechanical fix only" if mc else "no mechanical fix for this pattern"))
         else:
             cands += model_candidates(root, f, model)
         if not cands:
             why = ("no mechanical fix for this pattern and no model configured (add --provider)"
-                   if client.provider == "offline" else "model returned no usable diff")
+                   if client.provider == "offline" else
+                   "deadline: not enough time left for a model patch" if out_of_time else
+                   "model returned no usable diff")
             util.warn("no candidate: " + why)
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": why}, None))
