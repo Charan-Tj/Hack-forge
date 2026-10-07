@@ -159,18 +159,21 @@ class _NoToolchain:
 
 def run_universal(task, work_dir: str, client, approve: str = "critical",
                   interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
-                  deps: bool = False, review: bool = True) -> Dict:
+                  deps: bool = False, review: bool = True, deadline_min: float = 0) -> Dict:
     """Any-stack track: static discovery -> repair ensemble -> approval -> gates."""
     from . import universal
     P = _Progress(task, _NoToolchain(), client, work_dir, stages=STAGES_UNIVERSAL)
     util.info("track     : universal (static analysis + model repair + test/rescan gates)")
     util.info("model     : %s" % client.describe())
+    deadline = (time.time() + deadline_min * 60) if deadline_min else None
+    if deadline:
+        util.info("deadline  : %.0f min — no new finding or model call after that; report always written" % deadline_min)
     P.publish()
     try:
         P.set("risk", "running")
         res = universal.run(task, client, work_dir, approve=approve, interactive=interactive,
                             scanner=scanner, max_findings=max_findings, publish=P.publish, progress=P,
-                            deps=deps, review=review)
+                            deps=deps, review=review, deadline=deadline)
         P.ledger = res["risk_ledger"]
         P.disc_stats = res["discovery"]
         P.findings = res["findings"]
@@ -193,13 +196,22 @@ def run_universal(task, work_dir: str, client, approve: str = "critical",
                            % (time.time() - P.t0, client.calls, client.budget)))
         ev = P.evidence()
         ev["metrics"].update(m)
+        sub = report.write_submission(ev, work_dir)
+        util.good("report   : %s (%d row(s)) + report.csv" % (sub["md"], sub["rows"]))
         return {"evidence": ev, "paths": paths, "metrics": ev["metrics"]}
-    except Exception as e:
+    except (Exception, KeyboardInterrupt) as e:
         P.run_status = "error"
         P.error = "%s: %s" % (type(e).__name__, e)
         util.bad(P.error)
-        util.plain(util.dim(traceback.format_exc()[-600:]))
-        P.publish()
+        if not isinstance(e, KeyboardInterrupt):
+            util.plain(util.dim(traceback.format_exc()[-600:]))
+        # whatever happened, the judges get a report of what was finished
+        try:
+            paths = P.publish()
+            sub = report.write_submission(P.evidence(), work_dir)
+            util.warn("partial report written: %s (%d row(s))" % (sub["md"], sub["rows"]))
+        except Exception:
+            pass
         raise
     finally:
         util.set_log_file(None)
@@ -211,7 +223,8 @@ def run_task(task_path: str, out_root: str = "artifacts",
              uplift: bool = False, diff: Optional[str] = None,
              sarif: Optional[str] = None, approve: str = "critical",
              interactive: bool = True, scanner: str = "auto",
-             max_findings: int = 12, deps: bool = False, review: bool = True) -> Dict:
+             max_findings: int = 12, deps: bool = False, review: bool = True,
+             deadline_min: float = 0) -> Dict:
     task = config.load_task(task_path, diff_override=diff, sarif_override=sarif)
     work_dir = os.path.join(out_root, task.name)
     os.makedirs(work_dir, exist_ok=True)
@@ -227,7 +240,8 @@ def run_task(task_path: str, out_root: str = "artifacts",
         if client.provider == "ollama" and budget <= 6:
             client.budget = 40          # a local model is free: review + repair need more than 6 calls
         return run_universal(task, work_dir, client, approve=approve, interactive=interactive,
-                             scanner=scanner, max_findings=max_findings, deps=deps, review=review)
+                             scanner=scanner, max_findings=max_findings, deps=deps, review=review,
+                             deadline_min=deadline_min)
 
     tc = toolchain.detect(engine_pref)
     client = llm.LLMClient(provider=provider, model=model, budget=budget,

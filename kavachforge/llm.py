@@ -82,6 +82,7 @@ class LLMClient:
         self.budget = int(os.environ.get("KAVACH_LLM_BUDGET", budget))
         self.cache_dir = cache_dir
         self.log_dir = log_dir
+        self.deadline = None     # epoch seconds; no new live call after it
         self.calls = 0           # live network calls actually made
         self.cached = 0          # answers served from cache
         self.last_source = None  # "live" | "cache"
@@ -126,6 +127,8 @@ class LLMClient:
             raise LLMUnavailable("offline provider selected")
         if self.calls >= self.budget:
             raise LLMUnavailable("LLM budget of %d calls exhausted" % self.budget)
+        if self.deadline and time.time() >= self.deadline:
+            raise LLMUnavailable("deadline reached; no new model calls")
 
         attempts = 3 if self.provider == "ollama" else 1   # a local runner can be
         last = None                                         # restarting (OOM/reload)
@@ -157,7 +160,16 @@ class LLMClient:
                          "prompt": prompt, "response": response})
 
     # -- transports --------------------------------------------------------
+    def _timeout(self, default: int) -> int:
+        """Per-call timeout: the configured one, capped so a single slow call
+        cannot overrun the run deadline."""
+        t = int(os.environ.get("KAVACH_LLM_TIMEOUT", default))
+        if self.deadline:
+            t = max(15, min(t, int(self.deadline - time.time())))
+        return t
+
     def _http(self, url: str, headers: dict, payload: dict, timeout: int = 60) -> dict:
+        timeout = self._timeout(timeout)
         body = json.dumps(payload).encode()
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -180,15 +192,28 @@ class LLMClient:
             # node, e.g. OPENAI_BASE_URL=http://hpc-node:8000/v1 OPENAI_API_KEY=x
             key = os.environ.get("OPENAI_API_KEY", "none")
             base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+            try:
+                out = self._http(
+                    base + "/chat/completions",
+                    {"Authorization": "Bearer %s" % key,
+                     "content-type": "application/json"},
+                    {"model": self.model, "max_tokens": max_tokens, "temperature": 0,
+                     "messages": [{"role": "system", "content":
+                                   system or "You are a precise security engineer."},
+                                  {"role": "user", "content": prompt}]}, timeout=600)
+                return out["choices"][0]["message"]["content"]
+            except urllib.error.HTTPError as e:
+                if e.code not in (404, 405, 400, 501):
+                    raise
+            # Server exposes only /v1/completions (plain prompt): fold the
+            # system text into the prompt and read .text instead.
             out = self._http(
-                base + "/chat/completions",
-                {"Authorization": "Bearer %s" % key,
-                 "content-type": "application/json"},
-                {"model": self.model, "max_tokens": max_tokens,
-                 "messages": [{"role": "system", "content":
-                               system or "You are a precise security engineer."},
-                              {"role": "user", "content": prompt}]})
-            return out["choices"][0]["message"]["content"]
+                base + "/completions",
+                {"Authorization": "Bearer %s" % key, "content-type": "application/json"},
+                {"model": self.model, "max_tokens": max_tokens, "temperature": 0,
+                 "prompt": (system or "You are a precise security engineer.") + "\n\n" + prompt + "\n"},
+                timeout=600)
+            return out["choices"][0]["text"]
 
         if self.provider == "ollama":
             host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")

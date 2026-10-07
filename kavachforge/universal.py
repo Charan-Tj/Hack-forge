@@ -336,8 +336,12 @@ BUILTIN_RULES = [
     (("python", "php", "java", "javascript", "typescript", "go", "ruby"),
      r"(?:SELECT|INSERT|UPDATE|DELETE)\b[^\n;]*(?:\"|')\s*\+\s*\w|(?:SELECT|INSERT|UPDATE|DELETE)\b[^\n;]*%\s*\(|f\"(?:SELECT|INSERT|UPDATE|DELETE)\b",
      "CWE-89", "SQL Injection", "Critical", "SQL built by string concatenation/formatting.", None),
+    (("java",), r"(?:Runtime\.getRuntime\(\)\.exec|new\s+ProcessBuilder)\s*\([^;]*(?:\"(?:sh|bash|cmd(?:\.exe)?)\"\s*,\s*\"(?:-c|/c)\"|\+\s*\w)", "CWE-78",
+     "OS Command Injection", "Critical", "Shell command built from concatenated input (sh -c / cmd /c).", None),
     (("java",), r"Runtime\.getRuntime\(\)\.exec\s*\(", "CWE-78", "OS Command Injection", "High",
      "Runtime.exec with a composed command.", None),
+    (("java",), r"(?:\.sendRedirect\s*\(\s*(?![\"'])\w|(?:HttpHeaders\.LOCATION|\"Location\")\s*,\s*(?![\"'])\w)", "CWE-601",
+     "Open Redirect", "Medium", "Redirect target / Location header set from a non-literal value.", None),
     (("java",), r"new\s+ObjectInputStream\s*\(", "CWE-502", "Deserialization of Untrusted Data", "High",
      "Java native deserialization.", None),
     (("php",), r"\beval\s*\(|\bsystem\s*\(|\bshell_exec\s*\(|\bpassthru\s*\(", "CWE-78", "OS Command Injection", "Critical",
@@ -453,11 +457,34 @@ def is_test_path(rel: str) -> bool:
     return bool(_TEST_PATH_RE.search(rel))
 
 
+_HOLD_PATH_RE = re.compile(r"(^|/)(static|public|assets|resources/static|\.github|docs?|tests?|spec|specs|__tests__|"
+                           r"fixtures|mocks?|node_modules|vendor|examples?|samples?|benchmarks?|\.kavach)(/|$)|\.min\.js$", re.I)
+_SECURE_VARIANT_RE = re.compile(r"(impossible|secure|safe|fixed|hardened|patched|mitigat)", re.I)
+_COMMENT_RE = re.compile(r"^\s*(//|#|/\*|\*|<!--|--)")
+
+
+def hold_reason(f: SFinding, root: str = "") -> str:
+    """Precision mode: why a finding is HELD (kept in evidence, never reported).
+    False positives cost points, so anything that is not plainly application
+    code with a credible weakness stays out of the submission."""
+    if _HOLD_PATH_RE.search(f.file):
+        return "non-application path (static/test/CI/docs/vendor)"
+    if _SECURE_VARIANT_RE.search(os.path.basename(f.file)) or _SECURE_VARIANT_RE.search(f.func or ""):
+        return "deliberately secure variant (file/function named secure/impossible/safe/fixed)"
+    if f.snippet:
+        for ln in f.snippet.splitlines():
+            if ln.startswith("%5d  " % f.line) and _COMMENT_RE.match(ln[7:]):
+                return "flagged line is a comment"
+    if f.source == "model-review" and f.severity == "Low":
+        return "low-severity model opinion without tool evidence"
+    return ""
+
+
 def rank_key(f: SFinding):
     lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
     code = 0 if lang not in ("", "yaml", "json") else 1      # code before config/CI
-    if is_test_path(f.file):
-        code = 2                                              # test fixtures last
+    if is_test_path(f.file) or _HOLD_PATH_RE.search(f.file):
+        code = 2                                              # test fixtures / static / CI last
     return (code, -cwemod.severity_rank(f.severity), f.file, f.line)
 
 
@@ -842,7 +869,14 @@ def _scratch_copy(root: str, dest: str) -> None:
     for d in DEP_DIRS:
         src = os.path.join(root, d)
         if os.path.isdir(src) and not os.path.exists(os.path.join(dest, d)):
-            os.symlink(os.path.abspath(src), os.path.join(dest, d))
+            try:
+                os.symlink(os.path.abspath(src), os.path.join(dest, d))
+            except (OSError, NotImplementedError):
+                # Windows without symlink privilege: try a junction, else copy
+                r = util.run(["cmd", "/c", "mklink", "/J", os.path.join(dest, d), os.path.abspath(src)], timeout=60) \
+                    if os.name == "nt" else None
+                if r is None or not r.ok:
+                    shutil.copytree(src, os.path.join(dest, d), symlinks=True, dirs_exist_ok=True)
 
 
 INSTALLERS = {
@@ -877,7 +911,12 @@ def g0_apply(tree: str, diff: str) -> Tuple[bool, str]:
     tree = os.path.abspath(tree)
     pf = os.path.join(tree, ".kv_patch.diff")
     util.write_text(pf, diff)
-    r = util.run(["patch", "-p1", "-f", "-i", pf], cwd=tree, timeout=60)
+    if shutil.which("patch"):
+        r = util.run(["patch", "-p1", "-f", "-i", pf], cwd=tree, timeout=60)
+    else:   # Windows without GNU patch: git apply works outside a repository too
+        r = util.run(["git", "apply", "--ignore-whitespace", "-p1", pf], cwd=tree, timeout=60)
+        if r.ok:
+            r.out = "applied with git apply"
     try:
         os.remove(pf)
     except OSError:
@@ -1199,6 +1238,9 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
         "pov_size": 0, "pov_sha256": "", "repro_cmd": "re-run the analyzer on %s" % f.file,
         "pov_hexdump": f.snippet, "asan_report": "%s\n\n%s" % (f.message, f.fix_hint),
         "critical": f.critical, "duplicates": f.duplicates,
+        "hold_reason": getattr(f, "hold", ""),
+        "submit": (not getattr(f, "hold", "")) and not (f.source == "model-review" and
+                                                        validation.get("status") != "Verified"),
         "patch": ({"diff": chosen.diff, "source": chosen.source, "rationale": chosen.rationale,
                    "rejected": [c.status for c in cands if not c.chosen and c.status and c.status != "Verified"][:3]}
                   if chosen else {}),
@@ -1214,8 +1256,12 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
 def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str = "critical",
         interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
         publish=lambda: None, progress=None, deps: bool = False, review: bool = True,
-        review_files_n: int = 8) -> Dict:
+        review_files_n: int = 8, deadline: Optional[float] = None) -> Dict:
     root = task.root
+    client.deadline = deadline
+
+    def time_left() -> float:
+        return (deadline - time.time()) if deadline else 1e9
     stacks = task.raw.get("stacks") or detect_stacks(root)
     t0 = time.time()
     util.stage("Stack & surface")
@@ -1241,6 +1287,9 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         util.info(util.dim("model review skipped (no model; add --provider ollama for logic-bug review)"))
     for i, f in enumerate(found):
         f.id = "KV-%s-%03d" % (task.name.upper()[:6].replace("-", ""), i + 1)
+        f.hold = hold_reason(f, root)
+    n_hold = sum(1 for f in found if f.hold)
+    util.info("precision : %d SUBMIT candidates, %d HOLD (kept in evidence, not reported)" % (len(found) - n_hold, n_hold))
     util.good("%d unique finding(s) after dedupe (%s)" % (len(found), note)) if found else \
         util.warn("no finding (%s)" % note)
     by_sev: Dict[str, int] = {}
@@ -1248,7 +1297,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
     if found:
         util.info("severity  : " + ", ".join("%s %d" % kv for kv in sorted(by_sev.items(), key=lambda kv: -cwemod.severity_rank(kv[0]))))
-    todo = [f for f in found if patchable(f)][:max_findings] + [f for f in found if not patchable(f)]
+    todo = [f for f in found if patchable(f) and not f.hold][:max_findings] + \
+           [f for f in found if not patchable(f) and not f.hold] + [f for f in found if f.hold]
     n_patchable = sum(1 for f in found if patchable(f))
     if n_patchable > max_findings:
         util.info(util.dim("repairing the top %d patchable findings by severity; the rest are listed in the evidence"
@@ -1257,14 +1307,14 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
     findings_out: List[Dict] = []
     if progress is not None:
         progress.findings = findings_out
-    verified = 0
-    skipped = 0
+    verified = [0]
+    skipped = [0]
     scratch = os.path.abspath(os.path.join(work_dir, "scratch"))
-    base_tests: Tuple[Optional[bool], str] = (None, "")
-    tests_checked = False
+    tests_state: Dict = {"checked": False, "base": (None, "")}
 
-    for f in todo:
+    def _repair_one(f: SFinding) -> None:
         util.stage("Repair & verify — %s" % f.id)
+
         util.info("%s %s (%s) at %s:%d in %s%s" % (f.cwe, f.cwe_name, f.severity, f.file, f.line, f.func,
                                                    "  [CRITICAL AREA]" if f.critical else ""))
         lang = EXT_LANG.get(os.path.splitext(f.file)[1], "")
@@ -1279,7 +1329,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             findings_out.append(_finding_dict(f, [], None, {"status": "Needs human action", "gates": [],
                                                             "detail": why}, None))
             publish()
-            continue
+            return
         cands: List[Candidate] = []
         mc = mechanical_fix(root, f)
         if mc:
@@ -1292,7 +1342,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": why}, None))
             publish()
-            continue
+            return
         util.step("%d candidate(s): %s" % (len(cands), "; ".join(c.label for c in cands)))
 
         # ---- human approval ------------------------------------------------
@@ -1305,11 +1355,11 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                              if interactive and sys.stdin.isatty() else
                              "unattended run (--yes): first candidate auto-approved; the pause is recorded")
             if decision == "skip":
-                skipped += 1
+                skipped[0] += 1
                 findings_out.append(_finding_dict(f, cands, None, {"status": "Skipped by reviewer", "gates": [],
                                                                    "detail": "human chose not to patch"}, None))
                 publish()
-                continue
+                return
             if idx:
                 cands.insert(0, cands.pop(idx))
 
@@ -1333,8 +1383,9 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                 else:
                     ok, d = g2_rescan(tree, f, stacks, scanner_used); gates.append({"name": "G2 re-scan", "passed": ok, "detail": d})
             if ok:
-                if not tests_checked:
-                    base_tests = run_tests(root, stacks); tests_checked = True
+                if not tests_state["checked"]:
+                    tests_state["base"] = run_tests(root, stacks); tests_state["checked"] = True
+                base_tests = tests_state["base"]
                 if base_tests[0] is None:
                     gates.append({"name": "G3 tests", "passed": True, "detail": "not runnable here: " + base_tests[1]})
                 else:
@@ -1374,7 +1425,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                     cands.append(m)
         pr_bundle = None
         if chosen:
-            verified += 1
+            verified[0] += 1
             pr_bundle = _pr_bundle(task, f, chosen, validation, work_dir)
             util.good("PATCH VERIFIED — %s (%s)" % (chosen.label, validation.get("proof", "static")))
         else:
@@ -1382,13 +1433,34 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         findings_out.append(_finding_dict(f, cands, chosen, validation, pr_bundle))
         publish()
 
+    for f in todo:
+        if f.hold:
+            findings_out.append(_finding_dict(f, [], None, {"status": "Held", "gates": [],
+                                                            "detail": "HOLD: " + f.hold}, None))
+            continue
+        if time_left() <= 0:
+            findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
+                                                            "detail": "deadline reached before repair"}, None))
+            continue
+        try:
+            _repair_one(f)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:          # one bad finding must never kill the run
+            util.bad("finding %s failed: %s: %s" % (f.id, type(e).__name__, e))
+            findings_out.append(_finding_dict(f, [], None, {"status": "Error", "gates": [],
+                                                            "detail": "internal error: %s" % e}, None))
+            publish()
     done_ids = {d["id"] for d in findings_out}
     for f in found:
         if f.id not in done_ids:
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": "beyond --max-findings; not attempted"}, None))
     shutil.rmtree(scratch, ignore_errors=True)
-    metrics = {"unique_findings": len(found), "verified_patches": verified, "skipped_by_reviewer": skipped,
+    n_submit = sum(1 for d in findings_out if d.get("submit"))
+    util.info("precision : %d finding(s) SUBMIT, %d HOLD" % (n_submit, len(findings_out) - n_submit))
+    metrics = {"unique_findings": len(found), "verified_patches": verified[0], "skipped_by_reviewer": skipped[0],
+               "submit": n_submit, "hold": len(findings_out) - n_submit,
                "time_to_first_pov": ("%.1fs" % (time.time() - t0)) if found else "n/a",
                "raw_crashes": sum(1 + f.duplicates for f in found), "files_scanned": len(files),
                "stacks": stacks, "scanner": note}

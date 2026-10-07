@@ -296,7 +296,11 @@ offline (honest refusal: no byte-buffer entry point). Clones live in
 ```
 
 Flags: `--approve critical|all|auto` (default critical), `--yes` (never prompt),
-`--scanner auto|semgrep|builtin`, `--max-findings N` (default 12), `--deps`.
+`--scanner auto|semgrep|builtin`, `--max-findings N` (default 12), `--deps`,
+`--deadline-min M` (hard time box; report always written), `--no-review`.
+Input can be a git URL, a directory, or a `.tar.gz`/`.zip` of the source.
+Every run also writes `artifacts/<name>/report.md` + `report.csv` (S.No · title · severity ·
+location · steps taken) containing only SUBMIT findings — see docs/JUDGE_DEMO.md §7.
 Read the gates exactly as in the fuzz track; "not runnable here" / "not claimed" are honest
 skips, never passes in disguise.
 

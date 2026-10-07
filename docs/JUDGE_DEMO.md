@@ -187,3 +187,40 @@ running on this laptop; everything you saw works with the network cable unplugge
 
 **CI integration (if you have network + the repo open).**
 Open a PR that deletes a bounds check → the KavachForge Action comments a summary table, fails the check, and opens a `kavachforge/fix-*` PR with the fix + regression test. Say: "This is the whole loop wired into a real pull-request workflow."
+
+
+## 7. Final-round window (30 minutes, unattended, unseen app)
+
+**Inputs you get:** a `.tar.gz` of the source (plus IP:port, SSH, `restart.sh`) and a model
+endpoint. Work **locally on the unpacked source**; apply the patch files over SSH as the last
+manual step. Do not try to automate SSH + restart inside the window.
+
+```bash
+# 0-3 min: environment
+export OPENAI_BASE_URL=http://<host>:8000/v1 OPENAI_API_KEY=x        # organizer vLLM / OpenAI-style
+#   or: export OLLAMA_HOST=http://<host>:11434                       # organizer Ollama-style / your laptop
+./kavach doctor
+
+# 3-23 min: one command, hard time box, report always written
+./kavach onboard handover.tar.gz --name final --mode universal --run --provider openai --model <name> \
+        --yes --budget 20 --max-findings 8 --deadline-min 20
+#   (Windows: python -m kavachforge onboard ... ; --provider ollama --model phi4:14b for an Ollama endpoint)
+
+# 23-28 min: check and submit
+open artifacts/final/report.md          # S.No · title · severity · file/function/location · steps taken
+cat  artifacts/final/report.csv         # same rows, CSV
+ls   artifacts/final/pr/*/fix.patch     # verified patches to apply over SSH, then run restart.sh
+```
+
+What protects the score:
+- `--deadline-min` stops new findings and model calls at the limit; evidence, dashboard,
+  `report.md` and `report.csv` are written even on an error or Ctrl-C.
+- **Precision mode:** findings in static/public/assets, tests, CI, docs, vendored code, minified
+  JS, deliberately-"secure" variants, or unverified model opinions are **HOLD** (kept in
+  `evidence.json`, never in the report). Only **Verified** patches are offered as fixes; everything
+  else is "Reported, recommended fix: …". The console prints `precision : N SUBMIT, M HOLD`.
+- One failing finding is logged as `Error` and the run continues.
+- If the endpoint only has `/v1/completions`, the client falls back to it automatically. Time the
+  first model call: ~20 s → `--budget 40` is safe; ~2 min → `--budget 8`.
+- Ask before the window: exact model name, API style, report file type, what counts as a false
+  positive, whether duplicates are penalised.

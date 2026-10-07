@@ -219,9 +219,12 @@ def _finding_card(f: Dict) -> str:
     color = SEV_COLOR.get(sev, "#8aa0b2")
     vstat = f.get("validation", {}).get("status", "Unpatched")
     verified = vstat == "Verified"
-    vcls = "verified" if verified else ("pending" if vstat in ("Unpatched", "Needs human action") else "rejected")
+    vcls = "verified" if verified else ("pending" if vstat in ("Unpatched", "Needs human action", "Held") else "rejected")
     vtxt = ("PATCH VERIFIED" if verified else
             "REPAIR PENDING" if vstat == "Unpatched" else vstat.upper())
+    if "submit" in f:
+        vtxt += (' <span class="subchip">SUBMIT</span>' if f.get("submit")
+                 else ' <span class="subchip hold" title="%s">HOLD</span>' % _e(f.get("hold_reason", "")))
     gates = _gate_pipeline(f)
     frames = "".join(
         '<div class="frame %s">#%d %s <span class="loc">%s:%d</span></div>'
@@ -378,7 +381,8 @@ def render_html(ev: Dict) -> str:
     stats = "".join([
         stat("raw crashes → unique", "%d → %d" % (raw, len(findings))),
         stat("verified patches", n_verified),
-        stat("unverified alerts", 0),
+        stat("submit / hold", "%d / %d" % (sum(1 for f in findings if f.get("submit", True)),
+                                          sum(1 for f in findings if not f.get("submit", True)))),
         stat("time to 1st PoV" if not str(d.get("engine", "")).startswith("static") else "time to 1st finding",
              m.get("time_to_first_pov", "n/a")),
         stat("fuzz execs", "{:,}".format(d.get("execs", 0))) if not str(d.get("engine", "")).startswith("static")
@@ -413,12 +417,148 @@ def render_html(ev: Dict) -> str:
     }
 
 
+def _steps_taken(f: Dict) -> str:
+    """What KavachForge did about this finding, in the organizer's words."""
+    v = f.get("validation", {})
+    st = v.get("status", "Unpatched")
+    gates_run = [g["name"] for g in v.get("gates", []) if g.get("passed")
+                 and not any(w in g.get("detail", "").lower() for w in ("not claimed", "not runnable", "not checked", "no in-repo", "skipped"))]
+    patch = f.get("patch", {})
+    label = ""
+    for c in f.get("candidates", []):
+        if c.get("chosen"):
+            label = c.get("label", "")
+    if st == "Verified":
+        return "Verified patch (%s)%s; gates passed: %s%s" % (
+            label or patch.get("source", "patch"),
+            " — see pr/%s/fix.patch" % f["id"] if f.get("pr_bundle") else "",
+            ", ".join(gates_run) or "none",
+            "; proof: " + v["proof"] if v.get("proof") else "")
+    if f.get("cwe") == "CWE-798":
+        return "Reported; recommended fix: remove the credential from the repository and rotate it"
+    if st == "Needs human action":
+        return "Reported; recommended fix: " + (v.get("detail", "").replace("manual action: ", "") or "manual configuration change")
+    if st.startswith("Rejected") or st == "Rejected":
+        bad = next((g for g in v.get("gates", []) if not g.get("passed")), None)
+        return "Patch attempted but NOT submitted (failed %s: %s); reported with recommended fix: %s" % (
+            bad["name"] if bad else "gates", (bad["detail"][:80] if bad else ""), _fix_hint(f))
+    if st == "Held":
+        return "Held (not submitted): " + v.get("detail", "")
+    pre = ""
+    if v.get("detail") and "deadline" in v.get("detail", ""):
+        pre = "Deadline reached before repair; "
+    elif v.get("detail") and "model" in v.get("detail", "").lower():
+        pre = "No patch candidate (%s); " % v["detail"][:60]
+    return pre + "Reported, recommended fix: " + _fix_hint(f)
+
+
+_FIX_BY_CWE = {
+    "CWE-79": "HTML-encode output / use the template engine's auto-escaping; never insert request data as raw HTML",
+    "CWE-89": "use parameterised queries / prepared statements instead of string-built SQL",
+    "CWE-943": "never pass request data into $where/operators; validate type and use equality filters",
+    "CWE-95": "replace eval() with a safe parser (parseInt/Number/JSON.parse/ast.literal_eval) and validate the value",
+    "CWE-94": "do not compile or execute strings derived from input; use a whitelist of allowed operations",
+    "CWE-78": "avoid shell execution; call the program with an argument array and validate each argument",
+    "CWE-22": "resolve the path and require it to stay under the allowed base directory; reject '..'",
+    "CWE-601": "allow-list redirect targets or only accept relative paths",
+    "CWE-918": "allow-list destination hosts/schemes before making server-side requests",
+    "CWE-611": "disable external entities / DTD processing in the XML parser",
+    "CWE-502": "do not deserialise untrusted data; use a safe format (JSON) or a strict allow-list",
+    "CWE-798": "remove the credential from the repository, rotate it, and load it from the environment",
+    "CWE-327": "use a current algorithm (AES-GCM, SHA-256+, bcrypt/argon2 for passwords)",
+    "CWE-328": "replace MD5/SHA-1 with SHA-256 (or a password hash such as bcrypt/argon2)",
+    "CWE-295": "re-enable TLS certificate verification",
+    "CWE-614": "set the Secure flag on the cookie", "CWE-1004": "set HttpOnly on the session cookie",
+    "CWE-639": "check that the authenticated user owns the object (or is admin) before reading/updating it",
+    "CWE-862": "add an authorization check before the operation", "CWE-306": "require authentication on this endpoint",
+    "CWE-915": "copy only an explicit allow-list of fields from the request into the model",
+    "CWE-1333": "rewrite the regex without nested/adjacent unbounded quantifiers or bound the input length",
+    "CWE-770": "add rate limiting / lockout to login, OTP and token endpoints",
+    "CWE-347": "verify the JWT signature with a pinned algorithm and a strong secret",
+    "CWE-215": "remove or protect the debug endpoint", "CWE-489": "disable debug mode and hard-coded config in production",
+    "CWE-352": "add CSRF tokens / SameSite cookies on state-changing requests",
+    "CWE-1357": "pin the dependency/action to a specific version or digest",
+    "CWE-269": "run the container as a non-root user", "CWE-250": "drop unnecessary privileges",
+    "CWE-120": "bound the copy by the destination size (strncpy/snprintf with explicit lengths)",
+    "CWE-787": "check the index/length against the buffer capacity before writing",
+    "CWE-125": "check the index/length against the available input before reading",
+}
+
+
+def _fix_hint(f: Dict) -> str:
+    rep = f.get("asan_report", "") or ""
+    hint = rep.split("\n\n", 1)[1].strip() if "\n\n" in rep else ""
+    hint = hint.replace("mechanical: ", "")
+    return (_FIX_BY_CWE.get(f.get("cwe", ""), "") or hint
+            or "validate/encode the input at the flagged line and add a regression test")[:220]
+
+
+def submission_rows(ev: Dict) -> List[Dict]:
+    """Rows for the organizer's report: SUBMIT findings only, Critical -> Low."""
+    rows = []
+    for f in ev.get("findings", []):
+        if "submit" in f and not f.get("submit"):
+            continue
+        rows.append({
+            "title": "%s — %s" % (f.get("cwe", ""), f.get("cwe_name", "")),
+            "severity": f.get("severity", "Unknown"),
+            "location": "%s in %s" % (f.get("crash_file", ""), f.get("crash_func", "-")),
+            "steps": _steps_taken(f),
+            "id": f.get("id", ""),
+            "status": f.get("validation", {}).get("status", "Unpatched"),
+        })
+    rows.sort(key=lambda r: (SEV_ORDER.index(r["severity"]) if r["severity"] in SEV_ORDER else 9, r["id"]))
+    for i, r in enumerate(rows, 1):
+        r["sno"] = i
+    return rows
+
+
+def write_submission(ev: Dict, out_dir: str) -> Dict[str, str]:
+    """report.md + report.csv in the final-round format:
+    S.No · Vulnerability title · Severity · Vulnerable file/function/location · Steps taken."""
+    import csv
+    rows = submission_rows(ev)
+    t = ev.get("task", {})
+    m = ev.get("metrics", {})
+    md = ["# KavachForge — Vulnerability report: %s" % t.get("name", ""),
+          "", "Generated %s · %d finding(s) submitted · %d patch(es) verified · %d held back as low-confidence"
+          % (ev.get("generated_at", ""), len(rows), m.get("verified_patches", 0),
+             sum(1 for f in ev.get("findings", []) if "submit" in f and not f.get("submit"))),
+          "", "| S.No | Vulnerability title | Severity | Vulnerable file / function / location | Steps taken |",
+          "|---|---|---|---|---|"]
+    for r in rows:
+        md.append("| %d | %s | %s | `%s` | %s |" % (r["sno"], r["title"].replace("|", "/"), r["severity"],
+                                                  r["location"].replace("|", "/"), r["steps"].replace("|", "/")))
+    md += ["", "## How to read 'Steps taken'", "",
+           "- **Verified patch** — the fix passed KavachForge's gates: G0 applies, G1 builds/parses, G2 the finding is gone "
+           "(re-scan or PoV blocked), G3 the repo's tests show no new failure, G4 a regression/proof test, G5 behaviour "
+           "preserved or human approval. The patch file and a PR write-up are under `pr/<finding id>/`.",
+           "- **Reported** — the weakness is real enough to report but no patch met the gates; the recommended fix is given.",
+           "- Findings in static assets, tests, CI config, vendored code, deliberately 'secure' variants, or unverified model "
+           "opinions are kept in `evidence.json` but not submitted (precision over volume).",
+           "", "Full evidence chain: `dashboard.html` · machine-readable: `evidence.json` · integrity: `manifest.json`."]
+    mpath = os.path.join(out_dir, "report.md")
+    cpath = os.path.join(out_dir, "report.csv")
+    util.write_text(mpath, "\n".join(md) + "\n")
+    with open(cpath, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["S.No", "Vulnerability title", "Severity", "Vulnerable file / function / location", "Steps taken"])
+        for r in rows:
+            w.writerow([r["sno"], r["title"], r["severity"], r["location"], r["steps"]])
+    return {"md": mpath, "csv": cpath, "rows": len(rows)}
+
+
 def write_reports(ev: Dict, out_dir: str) -> Dict[str, str]:
     os.makedirs(out_dir, exist_ok=True)
     jpath = os.path.join(out_dir, "evidence.json")
     hpath = os.path.join(out_dir, "dashboard.html")
     util.write_json(jpath, ev)
     util.write_text(hpath, render_html(ev))
+    if ev.get("run_status") in ("done", "error"):
+        try:
+            write_submission(ev, out_dir)
+        except Exception:
+            pass
     # Keep the showcase index live too, if one has been set up.
     root = os.path.dirname(os.path.abspath(out_dir))
     cfg = os.path.join(root, ".showcase.json")
@@ -562,6 +702,8 @@ pre.hex{max-height:150px}pre.asan{max-height:230px;white-space:pre-wrap}
 .ts{font-weight:700;font-size:12px}.tm{color:var(--mut);font-size:11px;margin-top:6px}
 .tcard.ok .ts{color:var(--ok)}.tcard.clean .ts{color:var(--acc)}.tcard.warn .ts,.tcard.err .ts{color:var(--bad)}
 .tcard.running .ts{color:#ffd23f;animation:pulse 1.2s infinite}.tcard.pending{opacity:.6}
+.subchip{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:10px;background:#1f5e36;color:#cfead9}
+.subchip.hold{background:#3b3b1f;color:#ffd23f}
 .sevchips{margin:8px 0 2px}.sc2{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;color:#0b0f14;margin:2px 4px 2px 0}
 /* --- look --- */
 body{background:radial-gradient(1200px 500px at 10%% -10%%,#122238 0%%,var(--bg) 60%%) fixed}

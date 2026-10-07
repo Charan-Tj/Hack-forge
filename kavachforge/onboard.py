@@ -132,9 +132,31 @@ def fetch(spec: str, name: Optional[str] = None, dest_dir: Optional[str] = None,
         if not r.ok:
             raise RuntimeError("clone failed: " + (r.err or r.out)[-400:])
         return name, dest
+    if os.path.isfile(spec) and spec.lower().endswith((".tar.gz", ".tgz", ".tar", ".zip", ".tar.bz2", ".tar.xz")):
+        # The jury hands over the source as an archive: unpack it next to the
+        # other onboarded targets and treat the unpacked tree as the repo.
+        import tarfile
+        import zipfile
+        if not name or name == _name_from(spec):
+            name = re.sub(r"\.(tar\.gz|tgz|tar|zip|tar\.bz2|tar\.xz)$", "", os.path.basename(spec), flags=re.I)
+            name = re.sub(r"[^A-Za-z0-9_]+", "", name).lower() or "archive"
+        dest = os.path.join(dest_dir or os.path.join(config.PROJECT_ROOT, "targets", "_onboarded"), name)
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        os.makedirs(dest)
+        if spec.lower().endswith(".zip"):
+            with zipfile.ZipFile(spec) as z:
+                z.extractall(dest)
+        else:
+            with tarfile.open(spec) as t:
+                t.extractall(dest)
+        entries = [e for e in os.listdir(dest) if not e.startswith(".")]
+        if len(entries) == 1 and os.path.isdir(os.path.join(dest, entries[0])):
+            dest = os.path.join(dest, entries[0])       # archive wrapped in one top-level dir
+        return name, dest
     root = os.path.abspath(spec)
     if not os.path.isdir(root):
-        raise FileNotFoundError("not a directory or URL: %s" % spec)
+        raise FileNotFoundError("not a directory, archive or URL: %s" % spec)
     return name, root
 
 

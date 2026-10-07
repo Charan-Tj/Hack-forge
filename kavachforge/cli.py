@@ -42,7 +42,8 @@ def _common_kwargs(args, provider=None):
                 scanner=getattr(args, "scanner", "auto"),
                 max_findings=getattr(args, "max_findings", 12),
                 deps=getattr(args, "deps", False),
-                review=not getattr(args, "no_review", False))
+                review=not getattr(args, "no_review", False),
+                deadline_min=getattr(args, "deadline_min", 0))
 
 
 def _run_many(names, args, provider=None, on_each=None) -> int:
@@ -454,6 +455,9 @@ def main(argv=None) -> int:
         sp.add_argument("--scanner", choices=["auto", "semgrep", "builtin"], default="auto",
                         help="universal track analyzer")
         sp.add_argument("--max-findings", type=int, default=12, help="universal track: repair at most N")
+        sp.add_argument("--deadline-min", type=float, default=0,
+                        help="hard time box in minutes: stop starting findings/model calls after it; "
+                             "evidence + report are always written")
         sp.add_argument("--no-review", action="store_true",
                         help="universal track: skip the model's semantic review of handlers")
         sp.add_argument("--deps", action="store_true",
@@ -518,7 +522,7 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("onboard", help="bring your own repo: clone/scan/build-fix an "
                         "arbitrary C/C++ project into a task (one command)")
-    sp.add_argument("repo", help="git URL or local directory")
+    sp.add_argument("repo", help="git URL, local directory, or a .tar.gz/.zip of the source")
     sp.add_argument("--name", default=None, help="task/target name (default: repo name)")
     sp.add_argument("--harness", default=None, help="substring selecting one shipped harness")
     sp.add_argument("--ref", default=None, help="branch or tag to clone (URL repos)")
