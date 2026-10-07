@@ -36,4 +36,4 @@ ls -la "$OUT"
 echo
 echo "On the jury box:"
 echo "  unzip kavachforge-final.zip -d kavachforge && cd kavachforge"
-echo "  ./run_final.sh <source.tar.gz> http://192.168.1.103:8000/v1 codellama-7b"
+echo "  ./run_final.sh <source.tar.gz>            # uses our own model (phi4:14b)"
