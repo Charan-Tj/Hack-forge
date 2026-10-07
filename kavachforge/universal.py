@@ -482,6 +482,7 @@ _COMMENT_RE = re.compile(r"^\s*(//|#|/\*|\*|<!--|--)")
 # earn half. So: submit only what clears a confidence bar, confirm borderline
 # findings with a second opinion, and keep the report current at all times.
 PRECISION_THRESHOLD = {"strict": 0.7, "balanced": 0.5, "recall": 0.3}
+REVIEW_SHARE = 0.35      # at most this share of the deadline goes to the review stage; the rest to repair
 
 _CONFIRM_PROMPT = """You are the second reviewer in a bug-bounty triage. A scanner flagged the code below.
 Decide whether this is a REAL, reachable weakness in this application (attacker-influenced data can reach
@@ -704,7 +705,7 @@ def _parse_review(resp: str) -> List[dict]:
 
 
 def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], existing: List[SFinding],
-                 limit: int = 8, log=lambda m: None) -> List[SFinding]:
+                 limit: int = 8, log=lambda m: None, stop_at: Optional[float] = None) -> List[SFinding]:
     """Ask the model to audit handler files; keep only findings whose cited
     evidence really is on the cited line (hallucination filter) and which
     static analysis has not already reported."""
@@ -713,6 +714,9 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
     out: List[SFinding] = []
     have = {(f.cwe, f.file) : f for f in existing}
     for rel in review_files(root, files, limit):
+        if stop_at and time.time() > stop_at:
+            log("review budget used (%.0f%% of the deadline) - moving on to repair" % (REVIEW_SHARE * 100))
+            break
         text = util.read_text(os.path.join(root, rel))
         lines = text.splitlines()
         code = _handler_windows(lines)
@@ -1010,16 +1014,63 @@ def install_deps(root: str, stacks: List[str], log=lambda m: None, timeout: int 
     return "no installer for %s" % ", ".join(stacks)
 
 
+def apply_unified_diff(tree: str, diff: str, fuzz: int = 3) -> Tuple[bool, str]:
+    """Minimal unified-diff applier for machines without patch/git: one or
+    more files, hunks applied by matching context with a small offset
+    tolerance. Fails closed on any mismatch."""
+    files = re.split(r"(?m)^--- ", diff)
+    applied = []
+    for chunk in files[1:]:
+        head, _, body = chunk.partition("\n")
+        m = re.match(r"^\+\+\+ (\S+)", body)
+        if not m:
+            return False, "malformed diff header"
+        rel = re.sub(r"^b/", "", m.group(1))
+        path = os.path.join(tree, rel)
+        if not os.path.exists(path):
+            return False, "no such file: " + rel
+        src = util.read_text(path).splitlines(keepends=True)
+        hunks = re.split(r"(?m)^@@ ", body.split("\n", 1)[1])[1:]
+        offset = 0
+        for h in hunks:
+            hm = re.match(r"-(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", h)
+            if not hm:
+                return False, "malformed hunk"
+            start = int(hm.group(1)) - 1 + offset
+            lines = h.split("\n")[1:]
+            old = [l[1:] + "\n" for l in lines if l.startswith((" ", "-"))]
+            new = [l[1:] + "\n" for l in lines if l.startswith((" ", "+"))]
+            if lines and lines[-1] == "":
+                pass
+            pos = None
+            for delta in [0] + [d for k in range(1, fuzz + 1) for d in (-k, k)]:
+                i = start + delta
+                if i < 0 or i + len(old) > len(src):
+                    continue
+                if [x.rstrip("\n") for x in src[i:i + len(old)]] == [x.rstrip("\n") for x in old]:
+                    pos = i; break
+            if pos is None:
+                return False, "hunk does not apply at %s:%d" % (rel, start + 1)
+            src[pos:pos + len(old)] = new
+            offset += len(new) - len(old)
+        util.write_text(path, "".join(src))
+        applied.append(rel)
+    return bool(applied), "patching file " + ", ".join(applied)
+
+
 def g0_apply(tree: str, diff: str) -> Tuple[bool, str]:
     tree = os.path.abspath(tree)
     pf = os.path.join(tree, ".kv_patch.diff")
     util.write_text(pf, diff)
     if shutil.which("patch"):
         r = util.run(["patch", "-p1", "-f", "-i", pf], cwd=tree, timeout=60)
-    else:   # Windows without GNU patch: git apply works outside a repository too
+    elif shutil.which("git"):   # git apply works outside a repository too
         r = util.run(["git", "apply", "--ignore-whitespace", "-p1", pf], cwd=tree, timeout=60)
         if r.ok:
             r.out = "applied with git apply"
+    else:                        # bare box: pure-Python applier (no external tools)
+        ok, msg = apply_unified_diff(tree, diff)
+        r = util.CmdResult(0 if ok else 1, msg if ok else "", "" if ok else msg, 0.0)
     try:
         os.remove(pf)
     except OSError:
@@ -1381,7 +1432,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
     model = client if client.provider != "offline" else None
     if review and model is not None:
         util.stage("Model review (logic bugs: authorization, mass assignment, exposure, enumeration)")
-        rv = model_review(root, files, model, found, limit=review_files_n, log=util.step)
+        rv = model_review(root, files, model, found, limit=review_files_n, log=util.step,
+                          stop_at=(t0 + REVIEW_SHARE * (deadline - t0)) if deadline else None)
         if rv:
             found = sorted(found + rv, key=rank_key)
             note += "; model review %d finding(s) (%s)" % (len(rv), client.model)

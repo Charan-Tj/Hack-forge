@@ -197,6 +197,15 @@ def run_universal(task, work_dir: str, client, approve: str = "critical",
                            % (time.time() - P.t0, client.calls, client.budget)))
         ev = P.evidence()
         ev["metrics"].update(m)
+        # the model writes the report rows (titles + steps taken) from the evidence
+        try:
+            if client.provider != "offline" and (not client.deadline or time.time() < client.deadline):
+                n = report.narrate_with_model(ev, client)
+                if n:
+                    util.good("report rows narrated by the model: %d" % n)
+                    P.findings = ev["findings"]; P.publish()
+        except Exception as e:
+            util.warn("model narration skipped: %s" % e)
         sub = report.write_submission(ev, work_dir)
         util.good("report   : %s (%d row(s)) + report.csv" % (sub["md"], sub["rows"]))
         return {"evidence": ev, "paths": paths, "metrics": ev["metrics"]}

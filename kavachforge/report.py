@@ -503,6 +503,80 @@ def _fix_hint(f: Dict) -> str:
             or "validate/encode the input at the flagged line and add a regression test")[:220]
 
 
+_NARRATE_PROMPT = """You are writing the final vulnerability report table for a security assessment. For each finding
+below, write (a) a precise one-line vulnerability title a reviewer would recognise (e.g. "SQL injection in
+get_user via unparameterised f-string query") and (b) "steps taken": 1-2 sentences, past tense, factual,
+describing what was found, what fix was applied (if any) and how it was verified, using ONLY the facts given.
+Do not invent gates, tests or outcomes that are not listed.
+
+Return a JSON array only: [{{"id": "<id>", "title": "<title>", "steps": "<steps taken>"}}]
+
+Findings:
+{rows}
+"""
+
+
+def narrate_with_model(ev: Dict, client) -> int:
+    """Let the model write the human-readable title + steps for each SUBMIT row
+    (one call). Facts come from the evidence; the model only phrases them.
+    Returns the number of rows it narrated; the deterministic text stays as
+    fallback for anything it skipped or got wrong."""
+    import json as _json
+    import re as _re
+    if client is None or getattr(client, "provider", "offline") == "offline":
+        return 0
+    facts = []
+    for f in ev.get("findings", []):
+        if "submit" in f and not f.get("submit"):
+            continue
+        v = f.get("validation", {})
+        gates = [("%s: %s" % (g["name"], "passed" if g["passed"] else "FAILED")) for g in v.get("gates", [])]
+        chosen = next((c.get("label") for c in f.get("candidates", []) if c.get("chosen")), None)
+        facts.append({"id": f["id"], "cwe": f.get("cwe"), "class": f.get("cwe_name"), "severity": f.get("severity"),
+                      "location": "%s in %s" % (f.get("crash_file"), f.get("crash_func")),
+                      "detected_by": f.get("asan_class"), "analyzer_message": (f.get("asan_report") or "")[:160],
+                      "status": v.get("status"), "fix_applied": chosen, "gates": gates,
+                      "deterministic_steps": _steps_taken(f)})
+    if not facts:
+        return 0
+    try:
+        resp = client.complete(_NARRATE_PROMPT.format(rows=_json.dumps(facts, indent=1)[:9000]),
+                               system="You write precise, factual security report rows. JSON only.", max_tokens=1800)
+    except Exception:
+        return 0
+    m = _re.search(r"\[.*\]", resp, _re.DOTALL)
+    items = []
+    if m:
+        try:
+            items = _json.loads(m.group(0))
+        except Exception:
+            items = [i for i in (_safe_obj(x) for x in _re.findall(r"\{[^{}]*\}", m.group(0), _re.DOTALL)) if i]
+    by_id = {f["id"]: f for f in ev.get("findings", [])}
+    n = 0
+    for it in items:
+        f = by_id.get(str(it.get("id", "")))
+        if not f:
+            continue
+        title, steps = str(it.get("title", "")).strip(), str(it.get("steps", "")).strip()
+        # guard: the narration must not claim a verification the evidence lacks
+        st = f.get("validation", {}).get("status", "")
+        if st != "Verified" and _re.search(r"\b(patched|fixed|verified|applied)\b", steps, _re.I) and "not" not in steps.lower():
+            continue
+        if 8 <= len(title) <= 140:
+            f["report_title"] = title
+        if 20 <= len(steps) <= 600:
+            f["report_steps"] = steps; n += 1
+    return n
+
+
+def _safe_obj(txt: str):
+    import json as _json
+    try:
+        return _json.loads(txt)
+    except Exception:
+        return None
+
+
 def submission_rows(ev: Dict) -> List[Dict]:
     """Rows for the organizer's report: SUBMIT findings only, Critical -> Low."""
     rows = []
@@ -510,10 +584,10 @@ def submission_rows(ev: Dict) -> List[Dict]:
         if "submit" in f and not f.get("submit"):
             continue
         rows.append({
-            "title": "%s — %s" % (f.get("cwe", ""), f.get("cwe_name", "")),
+            "title": f.get("report_title") or "%s — %s" % (f.get("cwe", ""), f.get("cwe_name", "")),
             "severity": f.get("severity", "Unknown"),
             "location": "%s in %s" % (f.get("crash_file", ""), f.get("crash_func", "-")),
-            "steps": _steps_taken(f),
+            "steps": f.get("report_steps") or _steps_taken(f),
             "id": f.get("id", ""),
             "status": f.get("validation", {}).get("status", "Unpatched"),
         })

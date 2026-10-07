@@ -34,7 +34,7 @@ class LLMUnavailable(Exception):
 DEFAULT_MODELS = {
     "anthropic": "claude-3-5-sonnet-20241022",
     "openai": "gpt-4o-mini",
-    "ollama": "devstral-small-2:24b",
+    "ollama": "phi4:14b",
 }
 
 
@@ -74,7 +74,7 @@ class LLMClient:
             have = ollama_models()
             if have and not any(h.split(":")[0] == self.model.split(":")[0] for h in have):
                 # evidence-ranked (docs/OFFLINE_MODELS.md): repair quality first, then review quality
-                order = ["devstral-small-2", "gpt-oss", "devstral", "gemma4", "phi4-reasoning", "phi4",
+                order = ["phi4:14b", "phi4", "devstral-small-2", "gpt-oss", "devstral", "gemma4", "phi4-reasoning",
                          "granite4", "gemma3", "granite", "qwen3.6", "qwen3-coder", "qwen2.5-coder", "qwen3",
                          "deepseek-coder", "llama3.3", "llama3.1", "mistral", "llama"]
                 ranked = sorted(have, key=lambda h: next((i for i, k in enumerate(order) if h.startswith(k)), 99))
