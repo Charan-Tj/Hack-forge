@@ -88,7 +88,7 @@ class LLMClient:
         self.calls = 0           # live network calls actually made
         self.cached = 0          # answers served from cache
         self.last_source = None  # "live" | "cache"
-        self.call_seconds: list = []   # wall time of each live call (for time planning)
+        self.call_seconds: list = []   # (seconds, kind) of each live call, for time planning
         os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
 
@@ -102,10 +102,13 @@ class LLMClient:
             return "ollama"
         return "offline"
 
-    def avg_call(self, default: float = 0.0) -> float:
+    def avg_call(self, default: float = 0.0, kind: str = "") -> float:
         """Mean wall time of the live calls so far (a slow CPU model can take
-        minutes per call; the pipeline plans its stages around this)."""
-        return (sum(self.call_seconds) / len(self.call_seconds)) if self.call_seconds else default
+        minutes per call; the pipeline plans its stages around this). With
+        `kind`, only calls of that kind count when any exist (a patch call is
+        much shorter than a review call)."""
+        xs = [s for s, k in self.call_seconds if not kind or k == kind] or [s for s, _ in self.call_seconds]
+        return (sum(xs) / len(xs)) if xs else default
 
     def describe(self) -> str:
         if self.provider == "offline":
@@ -121,7 +124,7 @@ class LLMClient:
         return os.path.join(self.cache_dir, key + ".json")
 
     # -- main entry --------------------------------------------------------
-    def complete(self, prompt: str, system: str = "", max_tokens: int = 1500) -> str:
+    def complete(self, prompt: str, system: str = "", max_tokens: int = 1500, kind: str = "") -> str:
         key = self._key(system, prompt)
         cpath = self._cache_path(key)
         if os.path.exists(cpath):
@@ -144,7 +147,7 @@ class LLMClient:
         for i in range(attempts):
             try:
                 text = self._call_live(prompt, system, max_tokens)
-                self.call_seconds.append(time.time() - t_start)
+                self.call_seconds.append((time.time() - t_start, kind))
                 break
             except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                     KeyError, ValueError, TimeoutError) as e:
@@ -153,7 +156,7 @@ class LLMClient:
                         and "timed out" not in str(e):
                     time.sleep(8 * (i + 1))
                     continue
-                self.call_seconds.append(time.time() - t_start)   # a timeout is a data point too
+                self.call_seconds.append((time.time() - t_start, kind))   # a timeout is a data point too
                 self._log(system, prompt, "ERROR: %s" % e, "error")
                 raise LLMUnavailable("transport error: %s" % e)
 

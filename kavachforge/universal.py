@@ -519,7 +519,7 @@ def confirm_finding(root: str, f: SFinding, client: Optional[llm.LLMClient]) -> 
     try:
         resp = client.complete(_CONFIRM_PROMPT.format(cwe=f.cwe, title=f.cwe_name, file=f.file, line=f.line,
                                                       why=f.message[:200], evidence=ev[:160], code=code),
-                               system="You are a precise, sceptical application-security reviewer.", max_tokens=160)
+                               system="You are a precise, sceptical application-security reviewer.", max_tokens=160, kind="confirm")
     except llm.LLMUnavailable as e:
         return None, str(e)
     head = resp.strip().split("\n", 1)
@@ -565,9 +565,9 @@ def apply_scoring(found: List[SFinding], root: str, client: Optional[llm.LLMClie
         if todo:
             log("second opinion: asking %s about %d borderline finding(s)… (one call each)" % (client.model, len(todo)))
         for n, f in enumerate(todo):
-            if stop_at and time.time() + client.avg_call() > stop_at:
+            if stop_at and time.time() + client.avg_call(kind="confirm") > stop_at:
                 log("second opinion stopped after %d (model answers in ~%.0fs; repair keeps its half of the window) - "
-                    "%d finding(s) keep their static confidence" % (n, client.avg_call(), len(todo) - n))
+                    "%d finding(s) keep their static confidence" % (n, client.avg_call(kind="confirm"), len(todo) - n))
                 break
             v, just = confirm_finding(root, f, client)
             if v is True:
@@ -732,10 +732,10 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
     todo = review_files(root, files, limit)
     for n, rel in enumerate(todo, 1):
         # stop when the NEXT call (at the model's measured speed) would overrun the slot
-        if stop_at and time.time() + client.avg_call() > stop_at:
+        if stop_at and time.time() + client.avg_call(kind="review") > stop_at:
             log("review slot used (%.0f%% of the deadline; this model answers in ~%.0fs) - "
                 "%d file(s) left unreviewed to protect repair time"
-                % (REVIEW_SHARE * 100, client.avg_call(), len(todo) - n + 1))
+                % (REVIEW_SHARE * 100, client.avg_call(kind="review"), len(todo) - n + 1))
             break
         text = util.read_text(os.path.join(root, rel))
         lines = text.splitlines()
@@ -744,7 +744,7 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
         try:
             resp = client.complete(_REVIEW_PROMPT.format(checklist=REVIEW_CHECKLIST, file=rel, code=code),
                                    system="You are a precise application-security auditor. JSON only.",
-                                   max_tokens=1200)
+                                   max_tokens=1200, kind="review")
         except llm.LLMUnavailable as e:
             util.warn("model review stopped: %s" % e)
             break
@@ -837,8 +837,10 @@ def check_policy(f: SFinding, diff: str) -> Optional[str]:
     if removed and not added:
         return "patch only deletes code; a fix must validate, encode or replace the unsafe call"
     joined = "\n".join(added)
-    if re.search(r"\beval\s*\(|child_process|os\.system|shell\s*=\s*True|\$where", joined):
-        return "patch introduces a new dangerous primitive"
+    m = re.search(r"\beval\s*\(|child_process|os\.system|shell\s*=\s*True|\$where", joined)
+    if m:
+        return ("patch still uses the dangerous primitive %r - the fix must remove it entirely "
+                "(use a plain query operator / parameterized call instead)" % m.group(0).strip())
     if re.search(r"(?i)todo|fixme|xxx", joined):
         return "patch contains placeholder text"
     return None
@@ -974,7 +976,7 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
     t0 = time.time()
     try:
         resp = client.complete(prompt, system="You are a careful application-security engineer. "
-                                              "You answer only in the requested edit format.", max_tokens=1800)
+                                              "You answer only in the requested edit format.", max_tokens=1800, kind="patch")
     except llm.LLMUnavailable as e:
         util.warn("model unavailable for repair: %s" % e)
         return []
@@ -1542,7 +1544,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         mc = mechanical_fix(root, f)
         if mc:
             cands.append(mc)
-        need = client.avg_call(60) * 1.2 + 30          # one patch call + gates, at measured speed
+        need = client.avg_call(60, kind="patch") * 1.1 + 20   # one patch call + gates, at measured patch speed
         out_of_time = model is not None and time_left() < need
         if out_of_time:
             util.warn("%.0fs left < ~%.0fs a model patch needs here: %s" %
@@ -1581,11 +1583,20 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
 
         chosen: Optional[Candidate] = None
         validation: Dict = {"status": "Rejected", "gates": []}
+        retried = [False]
         for c in cands:
             pol = check_policy(f, c.diff)
             if pol:
                 c.status = "policy: " + pol
                 util.step("%-28s rejected (policy: %s)" % (c.label, pol))
+                # reflection: once, tell the model why every candidate so far was refused
+                if (c.source == "model" and model is not None and not retried[0]
+                        and all((x.status or "").startswith("policy") for x in cands) and time_left() >= need):
+                    retried[0] = True
+                    more = model_candidates(root, f, client, prior_reason="policy: " + pol)
+                    for m in more[:1]:
+                        m.label = "retry: " + m.label
+                        cands.append(m)
                 continue
             gates: List[Dict] = []
             tree = os.path.join(scratch, "patched")
@@ -1634,7 +1645,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
             util.step("%-28s %s" % (c.label, c.status))
             validation = {"status": "Rejected", "gates": gates}
             # reflection: tell the model why, once
-            if c.source == "model" and model is not None and len(cands) < 4 and time_left() >= need:
+            if c.source == "model" and model is not None and len(cands) < 4 and not retried[0] and time_left() >= need:
+                retried[0] = True
                 more = model_candidates(root, f, client, prior_reason=c.status + ": " + gates[-1]["detail"])
                 for m in more[:1]:
                     m.label = "retry: " + m.label

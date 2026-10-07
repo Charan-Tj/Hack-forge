@@ -616,7 +616,7 @@ class TestTimePlan(unittest.TestCase):
     class _Slow:
         model = "slow:14b"
         def __init__(self): self.n = 0
-        def avg_call(self, default=0.0): return 150.0
+        def avg_call(self, default=0.0, kind=""): return 150.0
         def complete(self, *a, **k):
             self.n += 1; return "UNSURE\nno idea"
 
