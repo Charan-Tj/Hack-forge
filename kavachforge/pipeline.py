@@ -197,10 +197,15 @@ def run_universal(task, work_dir: str, client, approve: str = "critical",
                            % (time.time() - P.t0, client.calls, client.budget)))
         ev = P.evidence()
         ev["metrics"].update(m)
-        # the model writes the report rows (titles + steps taken) from the evidence
+        # deterministic report first (always there), then let the model
+        # narrate the rows - one call, allowed up to 2 min past the deadline
+        # because the deterministic file is already on disk
+        sub = report.write_submission(ev, work_dir)
         try:
-            if client.provider != "offline" and (not client.deadline or time.time() < client.deadline):
+            if client.provider != "offline" and (not client.deadline or time.time() < client.deadline + 120):
+                saved = client.deadline; client.deadline = None
                 n = report.narrate_with_model(ev, client)
+                client.deadline = saved
                 if n:
                     util.good("report rows narrated by the model: %d" % n)
                     P.findings = ev["findings"]; P.publish()
