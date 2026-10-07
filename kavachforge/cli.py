@@ -544,6 +544,10 @@ def main(argv=None) -> int:
     sp.add_argument("--uplift", action="store_true")
     sp.add_argument("--diff", default=None)
     sp.add_argument("--sarif", default=None)
+    sp.add_argument("--deps", action="store_true", help="install the repo's dependencies first so tests can run")
+    sp.add_argument("--no-review", action="store_true", help="skip the model's semantic review")
+    sp.add_argument("--deadline-min", type=float, default=0,
+                    help="hard time box in minutes (report always written)")
     sp.set_defaults(func=_cmd_onboard)
 
     sp = sub.add_parser("prefetch", help="cache semgrep rule packs + pull the local model so "
