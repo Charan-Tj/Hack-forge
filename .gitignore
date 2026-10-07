@@ -7,3 +7,5 @@ cache/llm/
 targets/_onboarded/
 .kavach/
 rules/semgrep/p_secrets.yml
+vendor/
+kavachforge-final.zip
