@@ -225,6 +225,14 @@ def _finding_card(f: Dict) -> str:
     if "submit" in f:
         vtxt += (' <span class="subchip">SUBMIT</span>' if f.get("submit")
                  else ' <span class="subchip hold" title="%s">HOLD</span>' % _e(f.get("hold_reason", "")))
+    conf_html = ""
+    if "confidence" in f:
+        cv = float(f.get("confidence", 0))
+        conf_html = ('<div class="conf" title="%s"><span class="confbar"><i style="width:%d%%;background:%s"></i></span>'
+                     '<span class="confn">confidence %.2f</span> <span class="muted">%s</span></div>'
+                     % (_e(f.get("confidence_why", "")), int(cv * 100),
+                        "#49e08a" if cv >= 0.7 else "#ffd23f" if cv >= 0.5 else "#ff8097", cv,
+                        _e(f.get("hold_reason", "")[:110]) if f.get("hold_reason") else ""))
     gates = _gate_pipeline(f)
     frames = "".join(
         '<div class="frame %s">#%d %s <span class="loc">%s:%d</span></div>'
@@ -292,6 +300,7 @@ def _finding_card(f: Dict) -> str:
         <span class="verdict %s">%s</span>
       </div>
       <div class="meta2"><span class="typechip" style="border-color:%s;color:%s">%s</span> %s &nbsp;|&nbsp; access: %s &nbsp;|&nbsp; signature <code>%s</code>%s</div>
+      %s
       <div class="grid">
         <div class="col">
           <h4>%s</h4>
@@ -320,6 +329,7 @@ def _finding_card(f: Dict) -> str:
         TYPE_COLOR.get(cwe_type(f.get("cwe", "")), "#64748b"), TYPE_COLOR.get(cwe_type(f.get("cwe", "")), "#64748b"),
         _e(cwe_type(f.get("cwe", ""))),
         _e(f.get("asan_class")), _e(f.get("access")), _e(f.get("signature")), dup_txt,
+        conf_html,
         lbl_site, _e(f.get("crash_file")), _e(f.get("crash_func")), frames,
         lbl_pov, pov_line,
         _e(f.get("pov_hexdump", "")),
@@ -554,11 +564,12 @@ def write_reports(ev: Dict, out_dir: str) -> Dict[str, str]:
     hpath = os.path.join(out_dir, "dashboard.html")
     util.write_json(jpath, ev)
     util.write_text(hpath, render_html(ev))
-    if ev.get("run_status") in ("done", "error"):
-        try:
-            write_submission(ev, out_dir)
-        except Exception:
-            pass
+    # Always keep the submission current: AIxCC-style scoring halves late
+    # submissions, so a report must exist at any moment the window closes.
+    try:
+        write_submission(ev, out_dir)
+    except Exception:
+        pass
     # Keep the showcase index live too, if one has been set up.
     root = os.path.dirname(os.path.abspath(out_dir))
     cfg = os.path.join(root, ".showcase.json")
@@ -702,6 +713,9 @@ pre.hex{max-height:150px}pre.asan{max-height:230px;white-space:pre-wrap}
 .ts{font-weight:700;font-size:12px}.tm{color:var(--mut);font-size:11px;margin-top:6px}
 .tcard.ok .ts{color:var(--ok)}.tcard.clean .ts{color:var(--acc)}.tcard.warn .ts,.tcard.err .ts{color:var(--bad)}
 .tcard.running .ts{color:#ffd23f;animation:pulse 1.2s infinite}.tcard.pending{opacity:.6}
+.conf{display:flex;align-items:center;gap:8px;font-size:11px;margin:2px 0 6px}
+.confbar{width:120px;height:7px;border-radius:999px;background:var(--panel2);border:1px solid var(--line);overflow:hidden}
+.confbar i{display:block;height:100%%}.confn{font-weight:700}
 .subchip{display:inline-block;margin-left:6px;padding:1px 6px;border-radius:5px;font-size:10px;background:#1f5e36;color:#cfead9}
 .subchip.hold{background:#3b3b1f;color:#ffd23f}
 .sevchips{margin:8px 0 2px}.sc2{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;color:#0b0f14;margin:2px 4px 2px 0}

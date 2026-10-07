@@ -43,7 +43,8 @@ def _common_kwargs(args, provider=None):
                 max_findings=getattr(args, "max_findings", 12),
                 deps=getattr(args, "deps", False),
                 review=not getattr(args, "no_review", False),
-                deadline_min=getattr(args, "deadline_min", 0))
+                deadline_min=getattr(args, "deadline_min", 0),
+                precision=getattr(args, "precision", "balanced"))
 
 
 def _run_many(names, args, provider=None, on_each=None) -> int:
@@ -458,6 +459,9 @@ def main(argv=None) -> int:
         sp.add_argument("--deadline-min", type=float, default=0,
                         help="hard time box in minutes: stop starting findings/model calls after it; "
                              "evidence + report are always written")
+        sp.add_argument("--precision", choices=["strict", "balanced", "recall"], default="balanced",
+                        help="submission policy (AIxCC-style accuracy penalty): strict submits only "
+                             "confidence>=0.7, balanced >=0.5, recall >=0.3")
         sp.add_argument("--no-review", action="store_true",
                         help="universal track: skip the model's semantic review of handlers")
         sp.add_argument("--deps", action="store_true",
@@ -548,6 +552,7 @@ def main(argv=None) -> int:
     sp.add_argument("--no-review", action="store_true", help="skip the model's semantic review")
     sp.add_argument("--deadline-min", type=float, default=0,
                     help="hard time box in minutes (report always written)")
+    sp.add_argument("--precision", choices=["strict", "balanced", "recall"], default="balanced")
     sp.set_defaults(func=_cmd_onboard)
 
     sp = sub.add_parser("prefetch", help="cache semgrep rule packs + pull the local model so "

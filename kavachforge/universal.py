@@ -126,6 +126,9 @@ class SFinding:
     critical: bool = False
     signature: str = ""
     duplicates: int = 0
+    confidence: float = 0.5        # 0..1 - probability this is a real, reportable weakness
+    conf_why: str = ""             # how the confidence was built (shown to the judge)
+    hold: str = ""
 
 
 _CWE_NAMES = {"CWE-78": "OS Command Injection", "CWE-79": "Cross-site Scripting", "CWE-89": "SQL Injection",
@@ -288,12 +291,15 @@ def findings_from_sarif(root: str, sarif: dict, prefix: str) -> List[SFinding]:
             snippet = "\n".join("%5d  %s" % (i + 1, lines[i]) for i in range(max(0, line - 3), min(len(lines), eline + 2)))
             short = rid.split(".")[-1]
             fix = rl.get("help", {}).get("text", "") or rl.get("fullDescription", {}).get("text", "")
+            conf_tag = next((t.split()[0] for t in tags if t.endswith("CONFIDENCE")), "MEDIUM")
+            conf = {"HIGH": 0.75, "MEDIUM": 0.55, "LOW": 0.35}.get(conf_tag, 0.5)
             out.append(SFinding(id="", rule=short, cwe=cwe_id, cwe_name=name or cwe_name_for(cwe_id),
                                 severity=_sev_for(cwe_id, level), file=fpath, line=line, end_line=eline,
                                 message=msg.strip(), snippet=snippet,
                                 func=_enclosing_func(lines, line, EXT_LANG.get(os.path.splitext(fpath)[1], "")),
                                 source="semgrep", fix_hint=fix[:600],
-                                critical=bool(CRITICAL_RE.search(fpath)) or cwe_id in CRITICAL_CWES))
+                                critical=bool(CRITICAL_RE.search(fpath)) or cwe_id in CRITICAL_CWES,
+                                confidence=conf, conf_why="semgrep rule %s confidence" % conf_tag.lower()))
     return out
 
 
@@ -377,6 +383,11 @@ BUILTIN_RULES = [
 ]
 
 
+BUILTIN_CONF = {"CWE-89": 0.65, "CWE-95": 0.6, "CWE-78": 0.6, "CWE-943": 0.65, "CWE-502": 0.6, "CWE-295": 0.7,
+                "CWE-1004": 0.7, "CWE-614": 0.7, "CWE-798": 0.5, "CWE-328": 0.45, "CWE-79": 0.45, "CWE-601": 0.5,
+                "CWE-347": 0.5, "CWE-915": 0.45, "CWE-215": 0.55, "CWE-1333": 0.35, "CWE-120": 0.5, "CWE-98": 0.6}
+
+
 def run_builtin(root: str, files: List[str]) -> List[SFinding]:
     out: List[SFinding] = []
     for rel in files:
@@ -400,7 +411,9 @@ def run_builtin(root: str, files: List[str]) -> List[SFinding]:
                                         severity=sev, file=rel, line=i + 1, end_line=i + 1, message=msg,
                                         snippet=snippet, func=_enclosing_func(lines, i + 1, lang), source="builtin",
                                         fix_hint=("mechanical: %s -> %s" % fix) if fix else "",
-                                        critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES))
+                                        critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES,
+                                        confidence=BUILTIN_CONF.get(cwe_id, 0.45),
+                                        conf_why="built-in pattern (%s)" % name.lower()))
     return out
 
 
@@ -461,6 +474,95 @@ _HOLD_PATH_RE = re.compile(r"(^|/)(static|public|assets|resources/static|\.githu
                            r"fixtures|mocks?|node_modules|vendor|examples?|samples?|benchmarks?|\.kavach)(/|$)|\.min\.js$", re.I)
 _SECURE_VARIANT_RE = re.compile(r"(impossible|secure|safe|fixed|hardened|patched|mitigat)", re.I)
 _COMMENT_RE = re.compile(r"^\s*(//|#|/\*|\*|<!--|--)")
+
+
+# Submission policy, modelled on DARPA AIxCC scoring: every correct finding/patch
+# earns points, every wrong one lowers a non-linear accuracy multiplier (90%
+# accuracy ~ no penalty, 50% -> -6%, 40% -> -13%), and last-minute submissions
+# earn half. So: submit only what clears a confidence bar, confirm borderline
+# findings with a second opinion, and keep the report current at all times.
+PRECISION_THRESHOLD = {"strict": 0.7, "balanced": 0.5, "recall": 0.3}
+
+_CONFIRM_PROMPT = """You are the second reviewer in a bug-bounty triage. A scanner flagged the code below.
+Decide whether this is a REAL, reachable weakness in this application (attacker-influenced data can reach
+the sink and cause the stated impact), or a FALSE_POSITIVE (constant/trusted data, dead or test code,
+already mitigated, or the pattern is benign here). If you cannot tell from this excerpt, say UNSURE.
+
+Flagged: {cwe} {title} at {file}:{line} - {why}
+Evidence line: {evidence}
+
+Answer with one word on the first line - REAL, FALSE_POSITIVE or UNSURE - then one sentence citing the
+line numbers that justify it.
+
+--- code (leading numbers are line numbers) ---
+{code}
+"""
+
+
+def confirm_finding(root: str, f: SFinding, client: Optional[llm.LLMClient]) -> Tuple[Optional[bool], str]:
+    """Second opinion on a borderline finding. Returns (True real / False FP /
+    None unsure, justification). Only adjusts confidence; never the evidence."""
+    if client is None:
+        return None, "no model"
+    text = util.read_text(os.path.join(root, f.file))
+    lines = text.splitlines()
+    lo, hi = max(0, f.line - 40), min(len(lines), f.end_line + 30)
+    code = "\n".join("%4d  %s" % (i + 1, lines[i]) for i in range(lo, hi))
+    ev = lines[f.line - 1].strip() if 0 < f.line <= len(lines) else ""
+    try:
+        resp = client.complete(_CONFIRM_PROMPT.format(cwe=f.cwe, title=f.cwe_name, file=f.file, line=f.line,
+                                                      why=f.message[:200], evidence=ev[:160], code=code),
+                               system="You are a precise, sceptical application-security reviewer.", max_tokens=160)
+    except llm.LLMUnavailable as e:
+        return None, str(e)
+    head = resp.strip().split("\n", 1)
+    verdict = head[0].strip().upper()
+    just = (head[1].strip() if len(head) > 1 else head[0][5:].strip())[:200]
+    if verdict.startswith("REAL"):
+        # a REAL verdict must point at real lines near the finding, or it is
+        # just agreement (small models say REAL to almost everything)
+        cited = [int(x) for x in re.findall(r"\b(\d{1,5})\b", just)]
+        if not any(abs(c - f.line) <= 60 and 1 <= c <= len(lines) for c in cited):
+            return None, "REAL without a line citation - treated as unsure"
+        return True, just
+    if verdict.startswith("FALSE"):
+        return False, just
+    return None, just or "unsure"
+
+
+def apply_scoring(found: List[SFinding], root: str, client: Optional[llm.LLMClient], mode: str,
+                  log=lambda m: None, max_confirm: int = 8) -> None:
+    """Compute final confidence and the SUBMIT/HOLD decision for each finding."""
+    thr = PRECISION_THRESHOLD.get(mode, 0.5)
+    # cheap evidence adjustments
+    for f in found:
+        why = [f.conf_why]
+        if f.duplicates:
+            f.confidence += 0.05; why.append("+ repeated sink in same function")
+        if f.critical and f.cwe in CRITICAL_CWES and f.source != "model-review":
+            f.confidence += 0.05; why.append("+ high-impact class")
+        if is_test_path(f.file) or _HOLD_PATH_RE.search(f.file):
+            f.confidence -= 0.3; why.append("- non-application path")
+        if _SECURE_VARIANT_RE.search(os.path.basename(f.file)) or _SECURE_VARIANT_RE.search(f.func or ""):
+            f.confidence -= 0.3; why.append("- 'secure' variant")
+        f.confidence = max(0.0, min(1.0, f.confidence))
+        f.conf_why = "; ".join(w for w in why if w)
+    # second opinion on borderline, otherwise-submittable findings
+    if client is not None:
+        border = [f for f in found if not f.hold and thr - 0.2 <= f.confidence < thr + 0.15]
+        border.sort(key=lambda f: -cwemod.severity_rank(f.severity))
+        for f in border[:max_confirm]:
+            v, just = confirm_finding(root, f, client)
+            if v is True:
+                f.confidence = min(1.0, f.confidence + 0.2); f.conf_why += "; + second opinion: REAL (%s)" % just[:80]
+            elif v is False:
+                f.confidence = max(0.0, f.confidence - 0.25); f.conf_why += "; - second opinion: FALSE_POSITIVE (%s)" % just[:80]
+            else:
+                f.conf_why += "; second opinion unsure"
+            log("confirm %-40s %s -> %.2f" % (f.id, "REAL" if v else ("FP" if v is False else "unsure"), f.confidence))
+    for f in found:
+        if not f.hold and f.confidence < thr:
+            f.hold = "confidence %.2f below the %s threshold %.2f (%s)" % (f.confidence, mode, thr, f.conf_why)
 
 
 def hold_reason(f: SFinding, root: str = "") -> str:
@@ -655,7 +757,8 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
                                 message=("%s (model review - unverified by a tool)" % str(it.get("why", "")).strip())[:400],
                                 snippet=snippet, func=str(it.get("function") or _enclosing_func(lines, hit, "")),
                                 source="model-review", fix_hint=str(it.get("fix", ""))[:300],
-                                critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES))
+                                critical=bool(CRITICAL_RE.search(rel)) or cwe_id in CRITICAL_CWES,
+                                confidence=0.4, conf_why="model opinion with line evidence"))
             kept += 1
         log("review %-36s %d finding(s) kept, %d discarded (evidence not on cited line / duplicate)" % (rel, kept, dropped))
     return out
@@ -1239,6 +1342,7 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
         "pov_hexdump": f.snippet, "asan_report": "%s\n\n%s" % (f.message, f.fix_hint),
         "critical": f.critical, "duplicates": f.duplicates,
         "hold_reason": getattr(f, "hold", ""),
+        "confidence": round(f.confidence, 2), "confidence_why": f.conf_why,
         "submit": (not getattr(f, "hold", "")) and not (f.source == "model-review" and
                                                         validation.get("status") != "Verified"),
         "patch": ({"diff": chosen.diff, "source": chosen.source, "rationale": chosen.rationale,
@@ -1256,7 +1360,7 @@ def _finding_dict(f: SFinding, cands: List[Candidate], chosen: Optional[Candidat
 def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str = "critical",
         interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
         publish=lambda: None, progress=None, deps: bool = False, review: bool = True,
-        review_files_n: int = 8, deadline: Optional[float] = None) -> Dict:
+        review_files_n: int = 8, deadline: Optional[float] = None, precision: str = "balanced") -> Dict:
     root = task.root
     client.deadline = deadline
 
@@ -1288,6 +1392,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
     for i, f in enumerate(found):
         f.id = "KV-%s-%03d" % (task.name.upper()[:6].replace("-", ""), i + 1)
         f.hold = hold_reason(f, root)
+    util.stage("Scoring policy (%s): confidence + second opinion" % precision)
+    apply_scoring(found, root, model if time_left() > 0 else None, precision, log=util.step)
     n_hold = sum(1 for f in found if f.hold)
     util.info("precision : %d SUBMIT candidates, %d HOLD (kept in evidence, not reported)" % (len(found) - n_hold, n_hold))
     util.good("%d unique finding(s) after dedupe (%s)" % (len(found), note)) if found else \
@@ -1426,6 +1532,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         pr_bundle = None
         if chosen:
             verified[0] += 1
+            f.confidence = min(1.0, f.confidence + 0.25); f.conf_why += "; + verified patch (G0-G5)"
             pr_bundle = _pr_bundle(task, f, chosen, validation, work_dir)
             util.good("PATCH VERIFIED — %s (%s)" % (chosen.label, validation.get("proof", "static")))
         else:

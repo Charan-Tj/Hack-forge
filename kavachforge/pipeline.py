@@ -159,7 +159,8 @@ class _NoToolchain:
 
 def run_universal(task, work_dir: str, client, approve: str = "critical",
                   interactive: bool = True, scanner: str = "auto", max_findings: int = 12,
-                  deps: bool = False, review: bool = True, deadline_min: float = 0) -> Dict:
+                  deps: bool = False, review: bool = True, deadline_min: float = 0,
+                  precision: str = "balanced") -> Dict:
     """Any-stack track: static discovery -> repair ensemble -> approval -> gates."""
     from . import universal
     P = _Progress(task, _NoToolchain(), client, work_dir, stages=STAGES_UNIVERSAL)
@@ -173,7 +174,7 @@ def run_universal(task, work_dir: str, client, approve: str = "critical",
         P.set("risk", "running")
         res = universal.run(task, client, work_dir, approve=approve, interactive=interactive,
                             scanner=scanner, max_findings=max_findings, publish=P.publish, progress=P,
-                            deps=deps, review=review, deadline=deadline)
+                            deps=deps, review=review, deadline=deadline, precision=precision)
         P.ledger = res["risk_ledger"]
         P.disc_stats = res["discovery"]
         P.findings = res["findings"]
@@ -224,7 +225,7 @@ def run_task(task_path: str, out_root: str = "artifacts",
              sarif: Optional[str] = None, approve: str = "critical",
              interactive: bool = True, scanner: str = "auto",
              max_findings: int = 12, deps: bool = False, review: bool = True,
-             deadline_min: float = 0) -> Dict:
+             deadline_min: float = 0, precision: str = "balanced") -> Dict:
     task = config.load_task(task_path, diff_override=diff, sarif_override=sarif)
     work_dir = os.path.join(out_root, task.name)
     os.makedirs(work_dir, exist_ok=True)
@@ -241,7 +242,7 @@ def run_task(task_path: str, out_root: str = "artifacts",
             client.budget = 40          # a local model is free: review + repair need more than 6 calls
         return run_universal(task, work_dir, client, approve=approve, interactive=interactive,
                              scanner=scanner, max_findings=max_findings, deps=deps, review=review,
-                             deadline_min=deadline_min)
+                             deadline_min=deadline_min, precision=precision)
 
     tc = toolchain.detect(engine_pref)
     client = llm.LLMClient(provider=provider, model=model, budget=budget,
