@@ -423,6 +423,7 @@ def discover(root: str, stacks: List[str], scanner: str = "auto", files: Optiona
     note = ""
     found: List[SFinding] = []
     if scanner in ("auto", "semgrep") and semgrep_available():
+        log("semgrep: scanning %d file(s) with cached rule packs… (10-90 s)" % len(files))
         sarif, note = run_semgrep(root, stacks)
         if sarif is not None:
             found = findings_from_sarif(root, sarif, "SG")
@@ -552,7 +553,10 @@ def apply_scoring(found: List[SFinding], root: str, client: Optional[llm.LLMClie
     if client is not None:
         border = [f for f in found if not f.hold and thr - 0.2 <= f.confidence < thr + 0.15]
         border.sort(key=lambda f: -cwemod.severity_rank(f.severity))
-        for f in border[:max_confirm]:
+        todo = border[:max_confirm]
+        if todo:
+            log("second opinion: asking %s about %d borderline finding(s)… (one call each)" % (client.model, len(todo)))
+        for f in todo:
             v, just = confirm_finding(root, f, client)
             if v is True:
                 f.confidence = min(1.0, f.confidence + 0.2); f.conf_why += "; + second opinion: REAL (%s)" % just[:80]
@@ -713,13 +717,15 @@ def model_review(root: str, files: List[str], client: Optional[llm.LLMClient], e
         return []
     out: List[SFinding] = []
     have = {(f.cwe, f.file) : f for f in existing}
-    for rel in review_files(root, files, limit):
+    todo = review_files(root, files, limit)
+    for n, rel in enumerate(todo, 1):
         if stop_at and time.time() > stop_at:
             log("review budget used (%.0f%% of the deadline) - moving on to repair" % (REVIEW_SHARE * 100))
             break
         text = util.read_text(os.path.join(root, rel))
         lines = text.splitlines()
         code = _handler_windows(lines)
+        log("review %d/%d %s … asking %s" % (n, len(todo), rel, client.model))
         try:
             resp = client.complete(_REVIEW_PROMPT.format(checklist=REVIEW_CHECKLIST, file=rel, code=code),
                                    system="You are a precise application-security auditor. JSON only.",
@@ -940,6 +946,9 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
                                   file=f.file, line=f.line, end_line=f.end_line, excerpt=excerpt)
     if prior_reason:
         prompt += "\nA previous attempt was rejected because: %s. Avoid that.\n" % prior_reason
+    util.step("asking %s for a patch%s … (this is the slow step on CPU)"
+              % (client.model, " (retry after rejection)" if prior_reason else ""))
+    t0 = time.time()
     try:
         resp = client.complete(prompt, system="You are a careful application-security engineer. "
                                               "You answer only in the requested edit format.", max_tokens=1800)
@@ -958,6 +967,7 @@ def model_candidates(root: str, f: SFinding, client: Optional[llm.LLMClient],
         c = candidate_from_text(root, f, name, body)
         if c:
             out.append(c)
+    util.step("model answered in %.0fs: %d usable candidate(s)" % (time.time() - t0, len(out)))
     return out[:3]
 
 
@@ -1598,6 +1608,7 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                                                             "detail": "HOLD: " + f.hold}, None))
             continue
         if time_left() <= 0:
+            util.warn("deadline reached: %s not repaired (finding stays in the report as unpatched)" % f.id)
             findings_out.append(_finding_dict(f, [], None, {"status": "Unpatched", "gates": [],
                                                             "detail": "deadline reached before repair"}, None))
             continue

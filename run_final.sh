@@ -23,6 +23,8 @@ MAX_FINDINGS="${MAX_FINDINGS:-8}"
 PRECISION="${PRECISION:-balanced}"
 BUDGET="${BUDGET:-auto}"
 PORT="${PORT:-8777}"
+# Live logs: python must not block-buffer behind `tee`, and keep colours there.
+export PYTHONUNBUFFERED=1 FORCE_COLOR="${FORCE_COLOR:-1}" PYTHONIOENCODING=utf-8
 
 say()  { printf '\033[1;36m[kavach]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m  ✔ %s\033[0m\n' "$*"; }
@@ -52,7 +54,7 @@ if ! command -v semgrep >/dev/null 2>&1 && ! "$PY" -m semgrep --version >/dev/nu
   fi
   if ! command -v semgrep >/dev/null 2>&1 && ! "$PY" -m semgrep --version >/dev/null 2>&1; then
     say "trying online pip install (60 s cap)…"
-    timeout 60 "$PY" -m pip install --user -q semgrep >>/tmp/kv_pip.log 2>&1 || true
+    timeout 60 "$PY" -m pip install --user -q semgrep >>/tmp/kv_pip.log 2>&1 || warn "online install did not finish (see /tmp/kv_pip.log)"
   fi
 fi
 export PATH="$HOME/.local/bin:$PATH"
@@ -92,19 +94,20 @@ ok "provider=$PROVIDER budget=$BUDGET deadline=${DEADLINE_MIN}min max-findings=$
 
 # ---------------------------------------------------------------- 4. doctor
 say "4/6 self-check"
-"$PY" -m kavachforge doctor >/tmp/kv_doctor.log 2>&1 && ok "doctor READY" || warn "doctor reported issues (see /tmp/kv_doctor.log) — continuing"
+if "$PY" -m kavachforge doctor >/tmp/kv_doctor.log 2>&1; then ok "doctor READY"
+else warn "doctor reported issues — continuing"; sed 's/^/    /' /tmp/kv_doctor.log | tail -12; fi
 
 # ---------------------------------------------------------------- 5. run (report is always written)
-say "5/6 run — artifacts/$NAME/"
+say "5/6 run — artifacts/$NAME/   (live log below; copy in artifacts/${NAME}_console.log)"
 mkdir -p artifacts
 ( "$PY" -m kavachforge serve --port "$PORT" >/dev/null 2>&1 & echo $! > /tmp/kv_serve.pid ) 2>/dev/null
+ok "dashboard live: http://localhost:$PORT/$NAME/dashboard.html"
 MODELARG=""; [ -n "$MODEL" ] && MODELARG="--model $MODEL"
 set +e
-"$PY" -m kavachforge onboard "$SRC" --name "$NAME" --mode universal --run \
+"$PY" -u -m kavachforge onboard "$SRC" --name "$NAME" --mode universal --run \
    --provider "$PROVIDER" $MODELARG --yes --budget "$BUDGET" --max-findings "$MAX_FINDINGS" \
    --deadline-min "$DEADLINE_MIN" --precision "$PRECISION" 2>&1 | tee "artifacts/${NAME}_console.log"
 RC=${PIPESTATUS[0]}
-set -e 2>/dev/null; set +e
 
 # ---------------------------------------------------------------- 6. deliverables
 say "6/6 deliverables"

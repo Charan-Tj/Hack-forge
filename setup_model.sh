@@ -68,8 +68,8 @@ curl -s -m 2 "$OLLAMA_HOST/api/version" >/dev/null 2>&1 && ok "ollama serving at
 if ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL"; then
   ok "model present: $MODEL"
 else
-  say "pulling $MODEL (one-time download)…"
-  ollama pull "$MODEL" >/tmp/kv_pull.log 2>&1 && ok "pulled $MODEL" || {
+  say "pulling $MODEL (one-time download, progress below)…"
+  ollama pull "$MODEL" 1>&2 && ok "pulled $MODEL" || {
     warn "pull failed (no internet?) — trying any model already on this machine"
     MODEL=$(ollama list 2>/dev/null | awk 'NR>1{print $1}' | head -1)
     [ -n "$MODEL" ] && ok "using $MODEL" || { warn "no model available"; echo "none"; exit 0; }
@@ -77,6 +77,7 @@ else
 fi
 
 # ---- 6. warm up (first call loads weights; measure it)
+say "loading $MODEL into memory (first call, can take 1-3 min)…"
 T0=$(date +%s)
 curl -s -m 600 "$OLLAMA_HOST/api/generate" -d "{\"model\":\"$MODEL\",\"prompt\":\"OK\",\"stream\":false,\"options\":{\"num_predict\":2}}" >/dev/null 2>&1
 ok "model warm (${MODEL}, first call $(( $(date +%s) - T0 ))s)"
