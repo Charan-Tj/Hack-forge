@@ -12,6 +12,149 @@ from . import util, __version__
 
 SEV_COLOR = {"Critical": "#ff4d6d", "High": "#ff8c42", "Medium": "#ffd23f",
              "Low": "#4dd0a7", "Unknown": "#8aa0b2"}
+SEV_ORDER = ["Critical", "High", "Medium", "Low", "Unknown"]
+
+# Vulnerability TYPE (family) from CWE - what judges ask after severity and class.
+CWE_TYPE = {
+    "Injection": {"78", "89", "94", "95", "943", "917", "98", "611", "77", "90", "91", "1336"},
+    "Memory safety": {"120", "121", "122", "125", "787", "416", "476", "674", "190", "191", "415",
+                      "119", "170", "131", "369", "401"},
+    "Access control / auth": {"639", "862", "863", "306", "287", "284", "285", "352", "521", "307", "204"},
+    "Crypto & secrets": {"327", "328", "326", "798", "347", "522", "295", "614", "1004", "319", "321", "330", "338"},
+    "Data exposure & config": {"200", "215", "489", "1357", "269", "250", "829", "16", "532", "209", "1275"},
+    "Input validation / DoS": {"1333", "770", "400", "20", "22", "23", "36", "434", "915", "502"},
+    "Cross-site scripting": {"79", "116", "80"},
+    "Redirect / SSRF": {"601", "918"},
+}
+
+
+def cwe_type(cwe: str) -> str:
+    n = (cwe or "").upper().replace("CWE-", "")
+    for fam, ids in CWE_TYPE.items():
+        if n in ids:
+            return fam
+    return "Other"
+
+
+TYPE_COLOR = {"Injection": "#ff4d6d", "Memory safety": "#ff8c42", "Access control / auth": "#c084fc",
+              "Crypto & secrets": "#ffd23f", "Data exposure & config": "#8aa0b2", "Input validation / DoS": "#4da3ff",
+              "Cross-site scripting": "#f472b6", "Redirect / SSRF": "#2dd4bf", "Other": "#64748b"}
+
+# The six gates, per track: a patch is trusted ONLY because each of these held.
+GATE_SPEC = {
+    "fuzz": [("G0", "Applies", "patch applies cleanly to the source tree"),
+             ("G1", "Rebuilds", "patched tree compiles with sanitizers"),
+             ("G2", "PoV blocked", "the exact crashing input no longer crashes"),
+             ("G3", "Tests", "repo regression suite still passes"),
+             ("G4", "Regression test", "new test fails unpatched, passes patched"),
+             ("G5", "Behaviour", "hundreds of valid inputs behave identically")],
+    "static": [("G0", "Applies", "patch applies cleanly to the repo"),
+               ("G1", "Syntax / build", "patched file parses or project compiles"),
+               ("G2", "Re-scan", "the finding is gone and nothing new appeared"),
+               ("G3", "Tests", "repo test suite shows no new failure"),
+               ("G4", "Proof test", "a test fails unpatched and passes patched"),
+               ("G5", "Human approval", "a reviewer approved critical-area changes")],
+}
+
+
+def _overview_html(findings: List[Dict]) -> str:
+    """Threat overview: severity histogram, CWE class table, type donut."""
+    if not findings:
+        return ""
+    sev = {k: 0 for k in SEV_ORDER}
+    sev_fixed = {k: 0 for k in SEV_ORDER}
+    cls: Dict[str, Dict] = {}
+    typ: Dict[str, int] = {}
+    for f in findings:
+        sv = f.get("severity", "Unknown") if f.get("severity") in SEV_ORDER else "Unknown"
+        sev[sv] += 1
+        if f.get("validation", {}).get("status") == "Verified":
+            sev_fixed[sv] += 1
+        c = cls.setdefault(f.get("cwe", "CWE-?"), {"name": f.get("cwe_name", ""), "n": 0, "fixed": 0, "sev": sv})
+        c["n"] += 1
+        c["fixed"] += 1 if f.get("validation", {}).get("status") == "Verified" else 0
+        if SEV_ORDER.index(sv) < SEV_ORDER.index(c["sev"]):
+            c["sev"] = sv
+        t = cwe_type(f.get("cwe", ""))
+        typ[t] = typ.get(t, 0) + 1
+    total = len(findings)
+    mx = max(sev.values()) or 1
+    bars = "".join(
+        '<div class="sevrow"><span class="sevname" style="color:%s">%s</span>'
+        '<span class="sevbar"><i style="width:%d%%;background:%s"></i></span>'
+        '<span class="sevn">%d<small>%s</small></span></div>'
+        % (SEV_COLOR[k], k, int(100 * sev[k] / mx), SEV_COLOR[k], sev[k],
+           (" · %d fixed" % sev_fixed[k]) if sev_fixed[k] else "")
+        for k in SEV_ORDER if sev[k] or k != "Unknown")
+    rows = "".join(
+        '<tr><td><span class="cwe" style="border-color:%s;color:%s">%s</span></td><td>%s</td>'
+        '<td class="n">%d</td><td class="n ok">%s</td></tr>'
+        % (SEV_COLOR[v["sev"]], SEV_COLOR[v["sev"]], _e(k), _e(v["name"][:60]), v["n"],
+           v["fixed"] if v["fixed"] else "&ndash;")
+        for k, v in sorted(cls.items(), key=lambda kv: (-kv[1]["n"], kv[0]))[:14])
+    # donut (pure SVG, no libraries - the dashboard must work offline)
+    segs, legend, acc = [], [], 0.0
+    R, C = 54, 70
+    circ = 2 * 3.14159 * R
+    for t, n in sorted(typ.items(), key=lambda kv: -kv[1]):
+        frac = n / total
+        segs.append('<circle r="%d" cx="%d" cy="%d" fill="none" stroke="%s" stroke-width="18" '
+                    'stroke-dasharray="%.2f %.2f" stroke-dashoffset="%.2f" transform="rotate(-90 %d %d)"></circle>'
+                    % (R, C, C, TYPE_COLOR.get(t, "#64748b"), circ * frac, circ * (1 - frac), -circ * acc, C, C))
+        legend.append('<div class="lg"><i style="background:%s"></i>%s <b>%d</b></div>'
+                      % (TYPE_COLOR.get(t, "#64748b"), _e(t), n))
+        acc += frac
+    donut = ('<svg viewBox="0 0 140 140" class="donut">%s<text x="70" y="66" text-anchor="middle" class="dn">%d</text>'
+             '<text x="70" y="84" text-anchor="middle" class="dl">findings</text></svg>' % ("".join(segs), total))
+    return """
+<h2>Threat overview &mdash; what was found</h2>
+<div class="ov">
+  <div class="card ovp"><h4>1 &middot; Severity</h4>%s</div>
+  <div class="card ovp"><h4>2 &middot; Class (CWE) &middot; count</h4><table class="cls"><tr><th>class</th><th>name</th><th>found</th><th>fixed</th></tr>%s</table></div>
+  <div class="card ovp"><h4>3 &middot; Type of vulnerability</h4><div class="dwrap">%s<div class="legend">%s</div></div></div>
+</div>""" % (bars, rows, donut, "".join(legend))
+
+
+def _gate_pipeline(f: Dict) -> str:
+    """The six-gate workflow for THIS patch: why it is (or is not) trusted."""
+    track = "static" if f.get("kind") == "static" else "fuzz"
+    spec = GATE_SPEC[track]
+    gates = f.get("validation", {}).get("gates", [])
+    by_prefix = {}
+    for g in gates:
+        by_prefix[g["name"].split()[0]] = g
+    nodes, reasons = [], []
+    status = f.get("validation", {}).get("status", "Unpatched")
+    for gid, label, meaning in spec:
+        g = by_prefix.get(gid)
+        if g is None:
+            cls, mark, detail = "wait", "&middot;", "not reached"
+        elif not g["passed"]:
+            cls, mark, detail = "fail", "&#10008;", g["detail"]
+        elif any(w in g["detail"].lower() for w in ("not claimed", "not runnable", "not checked", "no in-repo",
+                                                      "unattended", "no model", "skipped")):
+            cls, mark, detail = "soft", "&#8776;", g["detail"]
+        else:
+            cls, mark, detail = "pass", "&#10004;", g["detail"]
+        nodes.append('<div class="gn %s"><div class="gc">%s</div><div class="gid">%s</div><div class="gl">%s</div>'
+                     '<div class="gd" title="%s">%s</div></div>'
+                     % (cls, mark, gid, _e(label), _e(detail), _e(detail[:90])))
+        if g is not None and g["passed"] and cls == "pass":
+            reasons.append("<b>%s</b> %s" % (gid, _e(meaning)))
+    if status == "Verified":
+        soft = [n for n in spec if by_prefix.get(n[0]) and by_prefix[n[0]]["passed"]
+                and n[0] not in [r.split("</b>")[0][3:] for r in reasons]]
+        why = ("<div class=\"why\"><b>Why this patch is trusted:</b> " + "; ".join(reasons) +
+               ((". <span class='muted'>Honestly skipped: %s.</span>" % ", ".join(
+                   "%s (%s)" % (n[0], _e(by_prefix[n[0]]["detail"][:60])) for n in soft)) if soft else ".") + "</div>")
+    elif status.startswith("Rejected") or status.startswith("rejected"):
+        bad = next((g for g in gates if not g["passed"]), None)
+        why = ("<div class=\"why no\"><b>Not trusted:</b> stopped at %s &mdash; %s</div>"
+               % (_e(bad["name"]), _e(bad["detail"][:160])) if bad else "")
+    else:
+        why = '<div class="why muted">No candidate has entered the gates%s.</div>' % (
+            " &mdash; " + _e(f.get("validation", {}).get("detail", "")) if f.get("validation", {}).get("detail") else "")
+    return '<div class="pipe">%s</div>%s' % ("".join(nodes), why)
 
 
 def build_evidence(task, toolchain_desc, llm_desc, risk_ledger, discovery_stats,
@@ -79,9 +222,7 @@ def _finding_card(f: Dict) -> str:
     vcls = "verified" if verified else ("pending" if vstat in ("Unpatched", "Needs human action") else "rejected")
     vtxt = ("PATCH VERIFIED" if verified else
             "REPAIR PENDING" if vstat == "Unpatched" else vstat.upper())
-    gates = "".join(_gate_badge(g) for g in f.get("validation", {}).get("gates", []))
-    if not gates:
-        gates = '<span class="muted">awaiting repair &amp; verification&hellip;</span>'
+    gates = _gate_pipeline(f)
     frames = "".join(
         '<div class="frame %s">#%d %s <span class="loc">%s:%d</span></div>'
         % ("t" if fr["in_target"] else "", i, _e(fr["func"]), _e(fr["file"]), fr["line"])
@@ -147,7 +288,7 @@ def _finding_card(f: Dict) -> str:
         </div>
         <span class="verdict %s">%s</span>
       </div>
-      <div class="meta2">%s &nbsp;|&nbsp; access: %s &nbsp;|&nbsp; signature <code>%s</code>%s</div>
+      <div class="meta2"><span class="typechip" style="border-color:%s;color:%s">%s</span> %s &nbsp;|&nbsp; access: %s &nbsp;|&nbsp; signature <code>%s</code>%s</div>
       <div class="grid">
         <div class="col">
           <h4>%s</h4>
@@ -165,21 +306,23 @@ def _finding_card(f: Dict) -> str:
           %s
           %s
           %s
-          <h4>Verification gates</h4>
-          <div class="gates">%s</div>
           %s
         </div>
       </div>
+      <h4>Six-gate verification &mdash; why we trust this patch</h4>
+      %s
     </div>""" % (
         _e(f["id"]), color, color, _e(f.get("cwe")), _e(f.get("cwe_name")),
         color, _e(sev), vcls, vtxt,
+        TYPE_COLOR.get(cwe_type(f.get("cwe", "")), "#64748b"), TYPE_COLOR.get(cwe_type(f.get("cwe", "")), "#64748b"),
+        _e(cwe_type(f.get("cwe", ""))),
         _e(f.get("asan_class")), _e(f.get("access")), _e(f.get("signature")), dup_txt,
         lbl_site, _e(f.get("crash_file")), _e(f.get("crash_func")), frames,
         lbl_pov, pov_line,
         _e(f.get("pov_hexdump", "")),
         lbl_rep, _e(f.get("asan_report", "")),
         _e(patch.get("source", "")), _e(patch.get("rationale", "")),
-        reflect, diff_block, ens, gates, deliver)
+        reflect, diff_block, ens, deliver, gates)
 
 
 def _risk_rows(ledger: List[Dict]) -> str:
@@ -260,6 +403,7 @@ def render_html(ev: Dict) -> str:
         "status_pill": status_pill,
         "stages": _stage_strip(ev.get("stages", [])),
         "stats": stats,
+        "overview": _overview_html(findings),
         "ingest": ing_txt,
         "risk_rows": _risk_rows(ev["risk_ledger"]),
         "uplift": _uplift_html(ev.get("uplift")),
@@ -317,12 +461,23 @@ def render_index(root: str, tasks: List[str]) -> str:
             cls, txt = "warn", "%d finding(s) &middot; repair rejected" % nf
         else:
             cls, txt = "clean", "no verified crash (control)"
+        sev = {}
+        types = {}
+        for f in ev.get("findings", []):
+            sev[f.get("severity", "Unknown")] = sev.get(f.get("severity", "Unknown"), 0) + 1
+            t = cwe_type(f.get("cwe", "")); types[t] = types.get(t, 0) + 1
+        sevchips = "".join('<span class="sc2" style="background:%s">%d %s</span>' % (SEV_COLOR[k], sev[k], k)
+                           for k in SEV_ORDER if sev.get(k))
+        typechips = " &middot; ".join("%s %d" % (_e(t), n) for t, n in sorted(types.items(), key=lambda kv: -kv[1])[:4])
+        static = str(ev.get("discovery", {}).get("engine", "")).startswith("static")
+        tm = ("%d file(s) scanned" % ev.get("discovery", {}).get("files", 0)) if static else \
+             "%s execs &middot; first PoV %s" % ("{:,}".format(ev.get("discovery", {}).get("execs", 0)),
+                                                   _e(m.get("time_to_first_pov", "n/a")))
         cards.append('<a class="tcard %s" href="%s/dashboard.html"><div class="tn">%s</div>'
-                     '<div class="td">%s</div><div class="ts">%s</div>'
-                     '<div class="tm">%s execs &middot; first PoV %s</div></a>'
-                     % (cls, _e(name), _e(name), _e(ev["task"]["description"]), txt,
-                        "{:,}".format(ev.get("discovery", {}).get("execs", 0)),
-                        _e(m.get("time_to_first_pov", "n/a"))))
+                     '<div class="td">%s</div><div class="ts">%s</div><div class="sevchips">%s</div>'
+                     '<div class="tm">%s</div><div class="tm">%s</div></a>'
+                     % (cls, _e(name), _e(name), _e(ev["task"]["description"]), txt, sevchips,
+                        typechips, tm))
     return _INDEX % {"cards": "".join(cards), "ver": _e(__version__)}
 
 
@@ -368,7 +523,7 @@ td.rat{color:var(--mut);font-size:12px}
 .card.small{padding:10px 14px;font-size:13px}
 .chead{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .fid{font-weight:700;margin-right:8px}
-.cwe{border:1px solid;border-radius:6px;padding:2px 8px;font-size:12px;margin-right:8px}
+.cwe{border:1px solid;border-radius:6px;padding:2px 8px;font-size:12px;margin-right:8px;white-space:nowrap}
 .sev{border-radius:6px;padding:2px 8px;font-size:12px;color:#0b0f14;font-weight:700}
 .verdict{font-weight:700;font-size:12px;padding:5px 12px;border-radius:8px}
 .verdict.verified{background:#12361f;color:var(--ok);border:1px solid #1f5e36}
@@ -376,7 +531,7 @@ td.rat{color:var(--mut);font-size:12px}
 .verdict.pending{background:#2d2a12;color:#ffd23f;border:1px solid #5a4a12}
 .verdict.ok2{background:#12361f;color:var(--ok);border:1px solid #1f5e36;display:inline-block;margin-bottom:8px}
 .meta2{color:var(--mut);font-size:12px;margin:8px 0 4px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:8px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:8px}.grid>.col{min-width:0}
 .crash{font-size:13px}.rc{font-size:13px}
 .frame{font-size:12px;color:var(--mut);padding:1px 0}
 .frame.t{color:var(--tx)}
@@ -395,7 +550,7 @@ pre.hex{max-height:150px}pre.asan{max-height:230px;white-space:pre-wrap}
 .gate.ok{background:#12361f;color:var(--ok);border-color:#1f5e36}
 .gate.no{background:#3a1b22;color:var(--bad);border-color:#5e1f2c}
 .reflect{color:var(--mut);font-size:12px;margin:6px 0}
-.deliver{display:flex;flex-wrap:wrap;gap:6px}\ntable.ens{margin:4px 0 2px}table.ens td,table.ens th{padding:4px 8px;font-size:12px}table.ens tr.ok td{color:var(--ok)}table.ens tr.no td{color:var(--mut)}
+.deliver{display:flex;flex-wrap:wrap;gap:6px}.pipe{margin-top:10px}\ntable.ens{margin:4px 0 2px}table.ens td,table.ens th{padding:4px 8px;font-size:12px}table.ens tr.ok td{color:var(--ok)}table.ens tr.no td{color:var(--mut)}
 .dl-link{display:inline-block;border:1px solid var(--line);border-radius:6px;padding:4px 9px;font-size:12px;color:var(--mut)}
 .dl-link.ok{color:var(--ok);border-color:#1f5e36}
 .dl-link:hover{border-color:var(--acc);color:var(--tx)}
@@ -407,7 +562,50 @@ pre.hex{max-height:150px}pre.asan{max-height:230px;white-space:pre-wrap}
 .ts{font-weight:700;font-size:12px}.tm{color:var(--mut);font-size:11px;margin-top:6px}
 .tcard.ok .ts{color:var(--ok)}.tcard.clean .ts{color:var(--acc)}.tcard.warn .ts,.tcard.err .ts{color:var(--bad)}
 .tcard.running .ts{color:#ffd23f;animation:pulse 1.2s infinite}.tcard.pending{opacity:.6}
-@media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.tgrid{grid-template-columns:1fr}}
+.sevchips{margin:8px 0 2px}.sc2{display:inline-block;border-radius:5px;padding:1px 7px;font-size:11px;font-weight:700;color:#0b0f14;margin:2px 4px 2px 0}
+/* --- look --- */
+body{background:radial-gradient(1200px 500px at 10%% -10%%,#122238 0%%,var(--bg) 60%%) fixed}
+header{position:relative}
+header:before{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:linear-gradient(90deg,var(--acc),transparent 70%%)}
+.brand{font-size:26px}
+.stat{position:relative;overflow:hidden}
+.stat:after{content:"";position:absolute;inset:auto 0 0 0;height:2px;background:linear-gradient(90deg,var(--acc),transparent)}
+.card{box-shadow:0 1px 0 rgba(255,255,255,.02) inset,0 8px 24px -18px #000}
+/* --- threat overview --- */
+.ov{display:grid;grid-template-columns:1.1fr 1.5fr 1.1fr;gap:12px}
+.ovp h4{margin-top:0}
+.sevrow{display:grid;grid-template-columns:76px 1fr 72px;align-items:center;gap:8px;margin:7px 0}
+.sevname{font-size:12px;font-weight:700}
+.sevbar{height:10px;background:var(--panel2);border:1px solid var(--line);border-radius:999px;overflow:hidden}
+.sevbar i{display:block;height:100%%;border-radius:999px;transition:width .6s}
+.sevn{font-weight:700;text-align:right;font-size:13px}.sevn small{color:var(--mut);font-weight:400;font-size:10px;display:block;line-height:1}
+table.cls{border:0;background:transparent}table.cls td,table.cls th{padding:5px 6px;font-size:12px}
+table.cls td.n{text-align:right;font-weight:700}table.cls td.ok{color:var(--ok)}
+.dwrap{display:flex;gap:12px;align-items:center}
+.donut{width:150px;height:150px;flex:none}
+.donut .dn{fill:var(--tx);font-size:26px;font-weight:700}.donut .dl{fill:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:1px}
+.legend .lg{font-size:12px;color:var(--mut);margin:3px 0;display:flex;align-items:center;gap:6px}
+.legend .lg i{width:9px;height:9px;border-radius:2px;display:inline-block}.legend .lg b{color:var(--tx);margin-left:auto;padding-left:8px}
+.typechip{border:1px solid;border-radius:6px;padding:1px 7px;font-size:11px;font-weight:700;margin-right:6px}
+/* --- six-gate pipeline --- */
+.legendrow{display:flex;gap:14px;flex-wrap:wrap;margin:-4px 0 12px;font-size:11px;color:var(--mut)}
+.gn.mini{display:flex;align-items:center;gap:6px}.gn.mini .gc{width:18px;height:18px;font-size:11px}
+.pipe{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;position:relative;margin:6px 0 4px}
+.pipe:before{content:"";position:absolute;left:8%%;right:8%%;top:15px;height:2px;background:var(--line);z-index:0}
+.gn{position:relative;z-index:1;text-align:center}
+.gc{width:32px;height:32px;border-radius:50%%;margin:0 auto;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;border:2px solid var(--line);background:var(--panel2);color:var(--mut)}
+.gn.pass .gc{border-color:var(--ok);color:var(--ok);background:#12361f;box-shadow:0 0 0 4px rgba(73,224,138,.12)}
+.gn.fail .gc{border-color:var(--bad);color:var(--bad);background:#3a1b22;box-shadow:0 0 0 4px rgba(255,128,151,.12)}
+.gn.soft .gc{border-color:#ffd23f;color:#ffd23f;background:#2d2a12}
+.gn.wait .gc{opacity:.5}
+.gid{font-size:10px;color:var(--mut);margin-top:5px;letter-spacing:1px}
+.gl{font-size:12px;font-weight:700}
+.gn.wait .gl{color:var(--mut);font-weight:400}
+.gd{font-size:10.5px;color:var(--mut);line-height:1.3;margin-top:2px;overflow:hidden;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical}
+.why{font-size:12px;margin-top:10px;padding:8px 10px;border-radius:8px;background:#12361f;border:1px solid #1f5e36;color:#cfead9}
+.why.no{background:#3a1b22;border-color:#5e1f2c;color:#ffd2da}
+.why.muted{background:var(--panel2);border-color:var(--line);color:var(--mut)}
+@media(max-width:820px){.stats{grid-template-columns:repeat(2,1fr)}.grid{grid-template-columns:1fr}.tgrid{grid-template-columns:1fr}.ov{grid-template-columns:1fr}.pipe{grid-template-columns:repeat(3,1fr)}.pipe:before{display:none}}
 """
 
 _TEMPLATE = """<!doctype html>
@@ -430,12 +628,14 @@ _TEMPLATE = """<!doctype html>
   %(stages)s
 </header>
 <div class="stats">%(stats)s</div>
+%(overview)s
 <h2>Input signals</h2>
 <div class="card small">%(ingest)s</div>
 <h2>Risk ledger &mdash; diff-to-sink prioritization (pre-LLM, deterministic)</h2>
 <table><tr><th>score</th><th>function</th><th>location</th><th>sinks</th><th>why</th></tr>%(risk_rows)s</table>
 %(uplift)s
-<h2>Findings &mdash; verified evidence chain</h2>
+<h2>Findings &mdash; evidence chain, one card per vulnerability</h2>
+<div class="legendrow"><span class="gn pass mini"><span class="gc">&#10004;</span>gate passed</span><span class="gn soft mini"><span class="gc">&#8776;</span>honestly skipped / not claimed</span><span class="gn fail mini"><span class="gc">&#10008;</span>gate failed</span><span class="gn wait mini"><span class="gc">&middot;</span>not reached</span></div>
 %(cards)s
 <p class="muted" style="margin-top:24px;font-size:12px">KavachForge reports a finding only with a reproducible proof-of-vulnerability, and marks a patch Verified only after it builds, blocks that PoV, and passes the regression suite. Patches are recommendations for human review, not autonomous deployment.</p>
 </div>

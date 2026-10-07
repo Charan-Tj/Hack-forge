@@ -1296,8 +1296,14 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
         util.step("%d candidate(s): %s" % (len(cands), "; ".join(c.label for c in cands)))
 
         # ---- human approval ------------------------------------------------
+        approval_note = ("not a critical area: policy allows automatic patching (--approve critical)"
+                         if approve == "critical" else
+                         "automatic (--approve auto)" if approve == "auto" else "")
         if needs_approval(approve, f):
             decision, idx = ask_approval(f, cands, interactive)
+            approval_note = ("reviewer chose candidate #%d in the terminal" % ((idx or 0) + 1)
+                             if interactive and sys.stdin.isatty() else
+                             "unattended run (--yes): first candidate auto-approved; the pause is recorded")
             if decision == "skip":
                 skipped += 1
                 findings_out.append(_finding_dict(f, cands, None, {"status": "Skipped by reviewer", "gates": [],
@@ -1345,6 +1351,8 @@ def run(task: "config.Task", client: llm.LLMClient, work_dir: str, approve: str 
                 gates.append({"name": "G4 proof test", "passed": res is not False,
                               "detail": d + ("" if res is not None else " (not claimed)")})
                 ok = res is not False
+            if ok:
+                gates.append({"name": "G5 human approval", "passed": True, "detail": approval_note})
             c.gates = gates
             if ok:
                 c.status = "Verified"; c.chosen = True; chosen = c
