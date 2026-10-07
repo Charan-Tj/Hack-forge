@@ -608,3 +608,54 @@ class TestFinalRound(unittest.TestCase):
         name, dest = onboard.fetch(tgz, name="handover", dest_dir=tempfile.mkdtemp())
         self.assertEqual(name, "handover")
         self.assertTrue(os.path.exists(os.path.join(dest, "package.json")))   # unwrapped top-level dir
+
+
+class TestTimePlan(unittest.TestCase):
+    """A slow model must never eat the repair slot (the 0-patch VulnerableApp run)."""
+
+    class _Slow:
+        model = "slow:14b"
+        def __init__(self): self.n = 0
+        def avg_call(self, default=0.0): return 150.0
+        def complete(self, *a, **k):
+            self.n += 1; return "UNSURE\nno idea"
+
+    def _f(self, i, conf=0.55):
+        from kavachforge import universal as u
+        return u.SFinding("KV-%d" % i, "r", "CWE-79", "XSS", "High", "app/a%d.js" % i, 1, 1, "", "",
+                          confidence=conf, conf_why="t")
+
+    def test_second_opinion_stops_before_repair_slot(self):
+        import time as _t
+        from kavachforge import universal as u
+        found = [self._f(i) for i in range(6)]
+        c = self._Slow()
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(6):
+                os.makedirs(os.path.join(d, "app"), exist_ok=True)
+                open(os.path.join(d, "app", "a%d.js" % i), "w").write("x\n")
+            u.apply_scoring(found, d, c, "balanced", stop_at=_t.time() + 100)   # < one 150 s call
+        self.assertEqual(c.n, 0)                     # not a single call: it would overrun the slot
+        self.assertTrue(all(f.confidence == 0.55 for f in found))
+
+    def test_review_stops_when_next_call_overruns(self):
+        import time as _t
+        from kavachforge import universal as u
+        c = self._Slow()
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "routes"))
+            for i in range(3):
+                open(os.path.join(d, "routes", "r%d.js" % i), "w").write("app.get('/x', (req,res)=>{res.send(req.query.q)})\n")
+            files = u.source_files(d)
+            out = u.model_review(d, files, c, [], limit=3, stop_at=_t.time() + 60)
+        self.assertEqual(c.n, 0)
+        self.assertEqual(out, [])
+
+    def test_search_replace_accepts_unique_subline_fragment(self):
+        from kavachforge import universal as u
+        src = '    q = f"SELECT * FROM users WHERE username = \'{username}\'"\n    run(q)\n'
+        out = u._apply_search_replace(src, [('"SELECT * FROM users WHERE username = \'{username}\'"',
+                                             '"SELECT * FROM users WHERE username = :u"')])
+        self.assertEqual(out, '    q = f"SELECT * FROM users WHERE username = :u"\n    run(q)\n')
+        # ambiguous fragment (appears twice) is still refused
+        self.assertIsNone(u._apply_search_replace("a = x\nb = x\n", [("x", "y")]))

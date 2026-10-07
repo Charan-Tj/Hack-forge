@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import time
 import urllib.error
 import urllib.request
@@ -83,9 +84,11 @@ class LLMClient:
         self.cache_dir = cache_dir
         self.log_dir = log_dir
         self.deadline = None     # epoch seconds; no new live call after it
+        self.slot_end = None     # epoch seconds; the current stage's slot - caps one call's timeout
         self.calls = 0           # live network calls actually made
         self.cached = 0          # answers served from cache
         self.last_source = None  # "live" | "cache"
+        self.call_seconds: list = []   # wall time of each live call (for time planning)
         os.makedirs(cache_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
 
@@ -98,6 +101,11 @@ class LLMClient:
         if os.environ.get("KAVACH_USE_OLLAMA") or _ollama_running():
             return "ollama"
         return "offline"
+
+    def avg_call(self, default: float = 0.0) -> float:
+        """Mean wall time of the live calls so far (a slow CPU model can take
+        minutes per call; the pipeline plans its stages around this)."""
+        return (sum(self.call_seconds) / len(self.call_seconds)) if self.call_seconds else default
 
     def describe(self) -> str:
         if self.provider == "offline":
@@ -132,16 +140,20 @@ class LLMClient:
 
         attempts = 3 if self.provider == "ollama" else 1   # a local runner can be
         last = None                                         # restarting (OOM/reload)
+        t_start = time.time()
         for i in range(attempts):
             try:
                 text = self._call_live(prompt, system, max_tokens)
+                self.call_seconds.append(time.time() - t_start)
                 break
             except (urllib.error.URLError, urllib.error.HTTPError, OSError,
                     KeyError, ValueError, TimeoutError) as e:
                 last = e
-                if i + 1 < attempts:
+                if i + 1 < attempts and not isinstance(e, (TimeoutError, socket.timeout)) \
+                        and "timed out" not in str(e):
                     time.sleep(8 * (i + 1))
                     continue
+                self.call_seconds.append(time.time() - t_start)   # a timeout is a data point too
                 self._log(system, prompt, "ERROR: %s" % e, "error")
                 raise LLMUnavailable("transport error: %s" % e)
 
@@ -164,8 +176,9 @@ class LLMClient:
         """Per-call timeout: the configured one, capped so a single slow call
         cannot overrun the run deadline."""
         t = int(os.environ.get("KAVACH_LLM_TIMEOUT", default))
-        if self.deadline:
-            t = max(15, min(t, int(self.deadline - time.time())))
+        for end in (self.deadline, self.slot_end):
+            if end:
+                t = max(15, min(t, int(end - time.time())))
         return t
 
     def _http(self, url: str, headers: dict, payload: dict, timeout: int = 60) -> dict:
